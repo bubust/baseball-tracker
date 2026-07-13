@@ -1,0 +1,4 @@
+game_state.json
+tracker.log
+__pycache__/
+*.pyc
