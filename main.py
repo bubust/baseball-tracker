@@ -94,8 +94,14 @@ TEAM_ZH: dict[str, str] = {
 
 
 def team_zh(name: str) -> str:
-    """回傳中文隊名，找不到則回傳原名。"""
-    return TEAM_ZH.get(name, name)
+    """回傳中文隊名，精確比對優先，其次部分包含比對。"""
+    if name in TEAM_ZH:
+        return TEAM_ZH[name]
+    name_lower = name.lower()
+    for en, zh in TEAM_ZH.items():
+        if en.lower() in name_lower or name_lower in en.lower():
+            return zh
+    return name
 
 import httpx
 from telegram import Update
@@ -773,6 +779,10 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             away_zh = team_zh(g.away_team)
             home_zh = team_zh(g.home_team)
+            if away_zh == g.away_team:
+                log.debug(f"[未翻譯] {g.league.upper()} 客隊：{g.away_team!r}")
+            if home_zh == g.home_team:
+                log.debug(f"[未翻譯] {g.league.upper()} 主隊：{g.home_team!r}")
             lines.append(f"  {time_str} {away_zh} @ {home_zh}{score_str} [{status_str}]{odds_str}")
         lines.append("")
         total += len(games)
