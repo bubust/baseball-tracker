@@ -784,17 +784,26 @@ def determine_underdog_from_yunsai(
 
 
 def _attach_pinnacle_odds(ps_games: list[Game], pin_games: list[Game]):
-    """將 Pinnacle 的賠率對應貼到 playsport 場次（以隊名模糊比對）。"""
+    """將 Pinnacle 的賠率對應貼到 playsport 場次（以中文隊名比對）。"""
     for pg in ps_games:
         if pg.home_odds is not None:
             continue
-        h_norm = normalize(pg.home_team)
-        a_norm = normalize(pg.away_team)
+        pg_home_zh = pg.home_team   # playsport 已是中文
+        pg_away_zh = pg.away_team
         for pp in pin_games:
-            if (normalize(pp.home_team) in h_norm or h_norm in normalize(pp.home_team)) and \
-               (normalize(pp.away_team) in a_norm or a_norm in normalize(pp.away_team)):
-                pg.home_odds = pp.home_odds
-                pg.away_odds = pp.away_odds
+            pp_home_zh = team_zh(pp.home_team)   # Pinnacle 英文 → 中文
+            pp_away_zh = team_zh(pp.away_team)
+            if pg_home_zh == pp_home_zh and pg_away_zh == pp_away_zh:
+                # 主客場一致
+                pg.home_odds   = pp.home_odds
+                pg.away_odds   = pp.away_odds
+                pg.home_spread = pp.home_spread
+                break
+            elif pg_home_zh == pp_away_zh and pg_away_zh == pp_home_zh:
+                # 主客場相反 → 對調賠率，讓分值取反
+                pg.home_odds   = pp.away_odds
+                pg.away_odds   = pp.home_odds
+                pg.home_spread = (-pp.home_spread if pp.home_spread is not None else None)
                 break
 
 
@@ -921,10 +930,16 @@ async def monitor_cycle(context: ContextTypes.DEFAULT_TYPE):
                     g.away_odds = od["away_odds"]
             all_games.extend(mlb_games)
 
-        # KBO / NPB（Pinnacle）
+        # KBO / NPB：Playsport 提供完整比分（含已結束），Pinnacle 補賠率
         for lg in ["kbo", "npb"]:
             if config.get(lg):
-                all_games.extend(await fetch_pinnacle_games(client, lg))
+                ps_games = await fetch_playsport_scores(client, lg)
+                if ps_games:
+                    pin_games = await fetch_pinnacle_games(client, lg)
+                    _attach_pinnacle_odds(ps_games, pin_games)
+                    all_games.extend(ps_games)
+                else:
+                    all_games.extend(await fetch_pinnacle_games(client, lg))
 
         # 逐場處理
         for game in all_games:
