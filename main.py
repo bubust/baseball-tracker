@@ -1291,15 +1291,36 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
         fav_score = game.home_score if not ud_is_home else game.away_score
 
         gs = state.get(game.game_id, {})
-        t1 = "✅" if gs.get("first_score_notified") else ("🔥" if ud_score > 0 and fav_score == 0 else "⬜")
-        t2 = "✅" if gs.get("overtake_notified") else ("🚀" if gs.get("was_favorite_leading") and ud_score > fav_score else "⬜")
+
+        # 讓分顯示
+        spread = game.home_spread
+        if spread is not None:
+            pts = abs(spread)
+            ud_label  = f"受讓{pts:.1f}分"
+            fav_label = f"讓{pts:.1f}分"
+        else:
+            ud_label  = fmt_odds(ud_odds) if ud_odds else "弱"
+            fav_label = fmt_odds(fav_odds) if fav_odds else "強"
+
+        # 觸發狀態
+        t1_done = gs.get("first_score_notified")
+        t2_done = gs.get("overtake_notified")
+        if game.status == "final":
+            t1 = "✅" if t1_done else "❌"
+            t2 = "✅" if t2_done else "❌"
+        else:
+            t1 = "✅" if t1_done else ("🔥" if ud_score > 0 and fav_score == 0 else "⬜")
+            t2 = "✅" if t2_done else ("🚀" if gs.get("was_favorite_leading") and ud_score > fav_score else "⬜")
 
         ud_zh  = team_zh(underdog)
         fav_zh = team_zh(favorite)
+        inn_label = f" 第{game.inning}局" if game.inning and game.status == "live" else ""
+
         lines.append(
-            f"[{lg_tag}] {away_zh} {score_str} {home_zh} [{status_str}]\n"
-            f"  弱隊：{ud_zh}({fmt_odds(ud_odds)}) 強隊：{fav_zh}({fmt_odds(fav_odds)})\n"
-            f"  {t1} 弱隊先得分  {t2} 弱隊反超"
+            f"\n[{lg_tag}] {status_str}{inn_label}\n"
+            f"  💪 強隊（{fav_label}）：{fav_zh}  {fav_score}分\n"
+            f"  🐣 弱隊（{ud_label}）：{ud_zh}  {ud_score}分\n"
+            f"  🔥先得分：{t1}  |  🚀反超：{t2}"
         )
 
     if live_count == 0:
