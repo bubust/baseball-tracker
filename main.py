@@ -203,9 +203,10 @@ class Game:
     away_score: int
     inning:     int
     status:     str          # "live" | "final" | "scheduled"
-    home_odds:  Optional[int] = None
-    away_odds:  Optional[int] = None
-    game_time:  Optional[str] = None   # 台灣時間，格式 "HH:MM"
+    home_odds:   Optional[int]   = None
+    away_odds:   Optional[int]   = None
+    game_time:   Optional[str]   = None   # 台灣時間，格式 "HH:MM"
+    home_spread: Optional[float] = None   # 主隊讓分：負=讓(強隊)，正=受讓(弱隊)
 
 
 # ─── 設定 & 狀態 I/O ─────────────────────────────────────────────────────────
@@ -454,24 +455,43 @@ async def fetch_pinnacle_games(client: httpx.AsyncClient, league: str) -> list[G
         return []
 
     # 取得賠率
-    prices_map: dict[int, dict] = {}  # matchupId → {home_odds, away_odds}
+    prices_map: dict[int, dict] = {}  # matchupId → {home_odds, away_odds, home_spread}
     try:
         r2 = await client.get(f"{PINNACLE_BASE}/leagues/{lid}/markets/straight",
                               headers=PINNACLE_HEADERS, timeout=10)
         if r2.status_code == 200:
-            for mkt in r2.json():
+            raw_mkts = r2.json()
+            # ── Moneyline ──
+            for mkt in raw_mkts:
                 if mkt.get("key") != "s;0;m":
                     continue
                 mid = mkt["matchupId"]
                 h_price = a_price = None
                 for p in mkt.get("prices", []):
                     d = p.get("designation", "")
-                    if d == "home":
-                        h_price = p["price"]
-                    elif d == "away":
-                        a_price = p["price"]
+                    if d == "home":   h_price = p["price"]
+                    elif d == "away": a_price = p["price"]
                 if h_price is not None and a_price is not None:
-                    prices_map[mid] = {"home_odds": h_price, "away_odds": a_price}
+                    prices_map.setdefault(mid, {})
+                    prices_map[mid]["home_odds"] = h_price
+                    prices_map[mid]["away_odds"] = a_price
+
+            # ── Spread（讓分盤）：取最小絕對值那條線 ──
+            spread_best: dict[int, float] = {}  # mid → 最小 |handicap|
+            for mkt in raw_mkts:
+                key = mkt.get("key", "")
+                if not (key.startswith("s;0;s;") or key == "s;0;s"):
+                    continue
+                mid = mkt["matchupId"]
+                for p in mkt.get("prices", []):
+                    if p.get("designation") == "home" and "points" in p:
+                        h_pts = float(p["points"])
+                        if mid not in spread_best or abs(h_pts) < abs(spread_best[mid]):
+                            spread_best[mid] = h_pts
+            for mid, h_pts in spread_best.items():
+                prices_map.setdefault(mid, {})
+                prices_map[mid]["home_spread"] = h_pts
+
     except Exception as e:
         log.warning(f"[{league.upper()}] Pinnacle 賠率錯誤：{e}")
 
@@ -528,20 +548,22 @@ async def fetch_pinnacle_games(client: httpx.AsyncClient, league: str) -> list[G
         mid = ev["id"]
         if mid in prices_map:
             pm = prices_map[mid]
-            h_odds, a_odds = pm["home_odds"], pm["away_odds"]
+            h_odds = pm.get("home_odds")
+            a_odds = pm.get("away_odds")
 
         games.append(Game(
-            game_id    = str(mid),
-            league     = league,
-            home_team  = h_name,
-            away_team  = a_name,
-            home_score = h_score,
-            away_score = a_score,
-            inning     = inning,
-            status     = status,
-            home_odds  = h_odds,
-            away_odds  = a_odds,
-            game_time  = game_time_str,
+            game_id     = str(mid),
+            league      = league,
+            home_team   = h_name,
+            away_team   = a_name,
+            home_score  = h_score,
+            away_score  = a_score,
+            inning      = inning,
+            status      = status,
+            home_odds   = h_odds,
+            away_odds   = a_odds,
+            game_time   = game_time_str,
+            home_spread = prices_map.get(mid, {}).get("home_spread"),
         ))
 
     if games:
@@ -780,9 +802,26 @@ def _attach_pinnacle_odds(ps_games: list[Game], pin_games: list[Game]):
 def determine_sides(game: Game, odds: Optional[dict]) -> Optional[tuple]:
     """
     回傳 (underdog_name, favorite_name, ud_odds, fav_odds, underdog_is_home)
-    若無賠率或賠率相同回傳 None。
+    若無法判斷回傳 None。
+
+    判斷優先順序：
+    1. Pinnacle spread（讓分盤）：主隊 home_spread > 0 = 主隊受讓 = 主隊弱
+    2. Moneyline 賠率：正號賠率方為弱隊
     """
-    # 從 odds dict（MLB 路徑）或 game.home_odds/away_odds（Pinnacle 路徑）取賠率
+    # ── 優先：spread 讓分盤 ──
+    if game.home_spread is not None and game.home_spread != 0:
+        if game.home_spread > 0:
+            # 主隊受讓（正數）= 主隊是弱隊
+            h_o = game.home_odds or 0
+            a_o = game.away_odds or 0
+            return (game.home_team, game.away_team, h_o, a_o, True)
+        else:
+            # 主隊讓分（負數）= 主隊是強隊
+            h_o = game.home_odds or 0
+            a_o = game.away_odds or 0
+            return (game.away_team, game.home_team, a_o, h_o, False)
+
+    # ── 備用：moneyline 賠率 ──
     if odds:
         h_o, a_o = odds["home_odds"], odds["away_odds"]
     elif game.home_odds is not None and game.away_odds is not None:
@@ -793,9 +832,9 @@ def determine_sides(game: Game, odds: Optional[dict]) -> Optional[tuple]:
     if h_o == a_o:
         return None
 
-    if h_o < a_o:   # 主隊賠率較低 = 主隊是熱門
+    if h_o < a_o:   # 主隊賠率較低 = 主隊是強隊
         return (game.away_team, game.home_team, a_o, h_o, False)
-    else:           # 客隊是熱門
+    else:           # 客隊是強隊
         return (game.home_team, game.away_team, h_o, a_o, True)
 
 
@@ -810,6 +849,15 @@ def check_triggers(game: Game, gs: dict) -> list[str]:
     fav_odds   = gs["favorite_odds"]
     league_tag = game.league.upper()
     inning     = game.inning
+
+    # 讓分顯示（若有 spread 資料）
+    spread_val  = gs.get("home_spread")
+    ud_is_home2 = gs["underdog_is_home"]
+    if spread_val is not None:
+        pts = abs(spread_val)
+        spread_str = f"受讓{pts:.1f}分" if spread_val != 0 else ""
+    else:
+        spread_str = fmt_odds(ud_odds) if ud_odds else ""
 
     msgs: list[str] = []
 
@@ -826,9 +874,9 @@ def check_triggers(game: Game, gs: dict) -> list[str]:
     if gs.get("first_scorer") == "underdog" and not gs["first_score_notified"]:
         gs["first_score_notified"] = True
         msgs.append(
-            f"⚾ [{league_tag}] {underdog}({fmt_odds(ud_odds)}) "
+            f"⚾ [{league_tag}] {underdog}({spread_str}) "
             f"{ud_score}:{fav_score} "
-            f"{favorite}({fmt_odds(fav_odds)}) "
+            f"{favorite} "
             f"| 第{inning}局 🔥 弱隊先得分！"
         )
 
@@ -842,9 +890,9 @@ def check_triggers(game: Game, gs: dict) -> list[str]:
             and not gs["overtake_notified"]):
         gs["overtake_notified"] = True
         msgs.append(
-            f"⚾ [{league_tag}] {underdog}({fmt_odds(ud_odds)}) "
+            f"⚾ [{league_tag}] {underdog}({spread_str}) "
             f"{ud_score}:{fav_score} "
-            f"{favorite}({fmt_odds(fav_odds)}) "
+            f"{favorite} "
             f"| 第{inning}局 🚀 弱隊反超！"
         )
 
@@ -897,6 +945,7 @@ async def monitor_cycle(context: ContextTypes.DEFAULT_TYPE):
                     "underdog_is_home":     ud_is_home,
                     "underdog_odds":        ud_odds,
                     "favorite_odds":        fav_odds,
+                    "home_spread":          game.home_spread,
                     "first_score_checked":  False,
                     "first_scorer":         None,
                     "first_score_notified": False,
