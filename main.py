@@ -663,9 +663,8 @@ async def fetch_yunsai_handicap() -> dict[str, str]:
                 args=[
                     "--no-sandbox",
                     "--disable-dev-shm-usage",
-                    "--disable-gpu",
                     "--disable-setuid-sandbox",
-                    "--single-process",
+                    "--disable-blink-features=AutomationControlled",
                 ],
             )
             ctx = await browser.new_context(
@@ -676,12 +675,19 @@ async def fetch_yunsai_handicap() -> dict[str, str]:
                 ),
                 locale="zh-TW",
                 timezone_id="Asia/Taipei",
+                viewport={"width": 1280, "height": 800},
             )
+            # 隱藏自動化特徵，繞過 Cloudflare 偵測
+            await ctx.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
+                Object.defineProperty(navigator, 'languages', {get: () => ['zh-TW','zh','en-US','en']});
+                window.chrome = {runtime: {}};
+            """)
             page = await ctx.new_page()
             try:
-                await page.goto(YUNSAI_URL, wait_until="domcontentloaded", timeout=40000)
-                # 等 JS 完整渲染（Cloudflare + SPA 需要更多時間）
-                await page.wait_for_timeout(10000)
+                await page.goto(YUNSAI_URL, wait_until="networkidle", timeout=60000)
+                await page.wait_for_timeout(5000)
                 html = await page.content()
                 log.info(f"[運彩] 頁面載入完成，大小：{len(html)} bytes")
             except Exception as e:
