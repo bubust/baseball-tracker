@@ -680,8 +680,8 @@ async def fetch_yunsai_handicap() -> dict[str, str]:
             page = await ctx.new_page()
             try:
                 await page.goto(YUNSAI_URL, wait_until="domcontentloaded", timeout=40000)
-                # 等 JS 渲染完成
-                await page.wait_for_timeout(6000)
+                # 等 JS 完整渲染（Cloudflare + SPA 需要更多時間）
+                await page.wait_for_timeout(10000)
                 html = await page.content()
                 log.info(f"[運彩] 頁面載入完成，大小：{len(html)} bytes")
             except Exception as e:
@@ -693,7 +693,8 @@ async def fetch_yunsai_handicap() -> dict[str, str]:
         # 解析 受讓 / 讓
         soup = BeautifulSoup(html, "lxml")
         page_text = soup.get_text(separator="\n")
-        log.debug(f"[運彩] 頁面文字前1000字：\n{page_text[:1000]}")
+        # 輸出前 2000 字供 debug
+        log.info(f"[運彩] 頁面文字前2000字：\n{page_text[:2000]}")
 
         # 策略：找含「受讓」或「讓」的文字區塊，往上找隊名
         found_handicap = False
