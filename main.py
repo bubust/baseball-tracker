@@ -90,6 +90,9 @@ TEAM_ZH: dict[str, str] = {
     "Fukuoka SoftBank Hawks":      "福岡軟銀鷹",
     "SoftBank Hawks":              "軟銀鷹",
     "Seibu Lions":                 "西武獅",
+    "Saitama Seibu Lions":         "埼玉西武獅",
+    "Yokohama Bay Stars":          "橫濱海灣之星",
+    "Fukuoka Softbank Hawks":      "福岡軟銀鷹",
 }
 
 
@@ -405,14 +408,15 @@ async def fetch_pinnacle_games(client: httpx.AsyncClient, league: str) -> list[G
                 if mkt.get("key") != "s;0;m":
                     continue
                 mid = mkt["matchupId"]
-                prices = mkt.get("prices", [])
-                if len(prices) >= 2:
-                    prices_map[mid] = {
-                        "pid_0": prices[0]["participantId"],
-                        "price_0": prices[0]["price"],
-                        "pid_1": prices[1]["participantId"],
-                        "price_1": prices[1]["price"],
-                    }
+                h_price = a_price = None
+                for p in mkt.get("prices", []):
+                    d = p.get("designation", "")
+                    if d == "home":
+                        h_price = p["price"]
+                    elif d == "away":
+                        a_price = p["price"]
+                if h_price is not None and a_price is not None:
+                    prices_map[mid] = {"home_odds": h_price, "away_odds": a_price}
     except Exception as e:
         log.warning(f"[{league.upper()}] Pinnacle 賠率錯誤：{e}")
 
@@ -469,11 +473,7 @@ async def fetch_pinnacle_games(client: httpx.AsyncClient, league: str) -> list[G
         mid = ev["id"]
         if mid in prices_map:
             pm = prices_map[mid]
-            h_pid = home_p.get("id")
-            if pm["pid_0"] == h_pid:
-                h_odds, a_odds = pm["price_0"], pm["price_1"]
-            else:
-                h_odds, a_odds = pm["price_1"], pm["price_0"]
+            h_odds, a_odds = pm["home_odds"], pm["away_odds"]
 
         games.append(Game(
             game_id    = str(mid),
@@ -793,6 +793,83 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
+async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """手動查詢各聯盟目前比賽狀況，顯示是否已觸發條件。"""
+    # 可指定聯盟：/check npb  或  /check（全部）
+    cfg = load_config()
+    target = context.args[0].lower() if context.args else None
+    if target and target not in VALID_LEAGUES:
+        await update.message.reply_text(f"❌ 未知聯盟：{target}，請用 mlb/kbo/npb")
+        return
+
+    state  = load_state()
+    today  = date.today().isoformat()
+    lines  = [f"🔍 即時觸發檢查（{today}）\n"]
+
+    async with httpx.AsyncClient() as client:
+        all_games: list[Game] = []
+
+        leagues = [lg for lg in ["mlb", "kbo", "npb"]
+                   if cfg.get(lg) and (target is None or lg == target)]
+
+        if "mlb" in leagues:
+            mlb_games = await fetch_mlb_games(client)
+            mlb_odds  = await refresh_mlb_odds(client)
+            for g in mlb_games:
+                od = find_mlb_odds(g, mlb_odds)
+                if od:
+                    g.home_odds = od["home_odds"]
+                    g.away_odds = od["away_odds"]
+            all_games.extend(mlb_games)
+        for lg in ["kbo", "npb"]:
+            if lg in leagues:
+                all_games.extend(await fetch_pinnacle_games(client, lg))
+
+    if not all_games:
+        lines.append("目前無進行中賽事")
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    live_count = 0
+    for game in all_games:
+        if game.status == "scheduled":
+            continue
+        live_count += 1
+        sides = determine_sides(game, None)
+        lg_tag = game.league.upper()
+
+        away_zh = team_zh(game.away_team)
+        home_zh = team_zh(game.home_team)
+        score_str = f"{game.away_score}:{game.home_score}"
+        inn_str   = f" 第{game.inning}局" if game.inning else ""
+        status_str = "已結束" if game.status == "final" else f"進行中{inn_str}"
+
+        if sides is None:
+            lines.append(f"[{lg_tag}] {away_zh} {score_str} {home_zh} [{status_str}] — 無賠率，跳過")
+            continue
+
+        underdog, favorite, ud_odds, fav_odds, ud_is_home = sides
+        ud_score  = game.home_score if ud_is_home else game.away_score
+        fav_score = game.home_score if not ud_is_home else game.away_score
+
+        gs = state.get(game.game_id, {})
+        t1 = "✅" if gs.get("first_score_notified") else ("🔥" if ud_score > 0 and fav_score == 0 else "⬜")
+        t2 = "✅" if gs.get("overtake_notified") else ("🚀" if gs.get("was_favorite_leading") and ud_score > fav_score else "⬜")
+
+        ud_zh  = team_zh(underdog)
+        fav_zh = team_zh(favorite)
+        lines.append(
+            f"[{lg_tag}] {away_zh} {score_str} {home_zh} [{status_str}]\n"
+            f"  弱隊：{ud_zh}({fmt_odds(ud_odds)}) 強隊：{fav_zh}({fmt_odds(fav_odds)})\n"
+            f"  {t1} 弱隊先得分  {t2} 弱隊反超"
+        )
+
+    if live_count == 0:
+        lines.append("目前無進行中或已結束賽事")
+
+    await update.message.reply_text("\n".join(lines))
+
+
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "⚾ 棒球追蹤器指令\n\n"
@@ -800,6 +877,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/off mlb|kbo|npb — 關閉聯盟監控\n"
         "/status          — 目前狀態\n"
         "/today           — 今日全部賽程\n"
+        "/check [聯盟]    — 即時查觸發狀況\n"
         "/help            — 顯示說明\n\n"
         "觸發條件：\n"
         "🔥 弱隊先得分（正號賠率隊率先得分）\n"
@@ -820,6 +898,7 @@ def main():
     app.add_handler(CommandHandler("off",    cmd_off))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("today",  cmd_today))
+    app.add_handler(CommandHandler("check",  cmd_check))
     app.add_handler(CommandHandler("help",   cmd_help))
 
     app.job_queue.run_repeating(monitor_cycle, interval=POLL_INTERVAL, first=10)
