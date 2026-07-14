@@ -124,8 +124,9 @@ PINNACLE_LEAGUE_IDS = {
     "npb": 187703,
 }
 
-CONFIG_FILE = os.path.join(os.path.dirname(__file__), "config.json")
-STATE_FILE  = os.path.join(os.path.dirname(__file__), "game_state.json")
+CONFIG_FILE  = os.path.join(os.path.dirname(__file__), "config.json")
+STATE_FILE   = os.path.join(os.path.dirname(__file__), "game_state.json")
+RESULTS_FILE = os.path.join(os.path.dirname(__file__), "results.json")
 
 POLL_INTERVAL  = 60      # 秒
 ODDS_CACHE_TTL = 6 * 3600  # 賠率快取 6 小時
@@ -192,6 +193,20 @@ def load_state() -> dict:
 def save_state(state: dict):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2, ensure_ascii=False)
+
+
+def load_results() -> list:
+    if os.path.exists(RESULTS_FILE):
+        with open(RESULTS_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    return []
+
+
+def append_result(record: dict):
+    results = load_results()
+    results.append(record)
+    with open(RESULTS_FILE, "w", encoding="utf-8") as f:
+        json.dump(results, f, indent=2, ensure_ascii=False)
 
 
 # ─── 工具函式 ────────────────────────────────────────────────────────────────
@@ -638,7 +653,29 @@ async def monitor_cycle(context: ContextTypes.DEFAULT_TYPE):
             if game.status == "final" and gs.get("status") != "final":
                 gs["status"] = "final"
                 changed = True
-                log.info(f"[{game.league.upper()}] 比賽結束：{game.away_team} {game.away_score} @ {game.home_team} {game.home_score}")
+                ud_is_home = gs.get("underdog_is_home")
+                ud_score   = game.home_score if ud_is_home else game.away_score
+                fav_score  = game.home_score if not ud_is_home else game.away_score
+                ud_won = ud_score > fav_score
+                append_result({
+                    "date":          today,
+                    "league":        game.league,
+                    "away_team":     team_zh(game.away_team),
+                    "home_team":     team_zh(game.home_team),
+                    "away_score":    game.away_score,
+                    "home_score":    game.home_score,
+                    "underdog":      gs.get("underdog"),
+                    "favorite":      gs.get("favorite"),
+                    "underdog_odds": gs.get("underdog_odds"),
+                    "favorite_odds": gs.get("favorite_odds"),
+                    "underdog_won":  ud_won,
+                    "ud_triggered":  gs.get("first_score_notified", False),
+                    "overtake":      gs.get("overtake_notified", False),
+                })
+                log.info(
+                    f"[{game.league.upper()}] 比賽結束：{game.away_team} {game.away_score} "
+                    f"@ {game.home_team} {game.home_score} | 弱隊{'贏' if ud_won else '輸'}"
+                )
                 continue
 
             if gs.get("status") == "final":
@@ -793,6 +830,59 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
+async def cmd_record(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """顯示累積弱隊買贏/輸戰績。用法：/record [today|mlb|kbo|npb]"""
+    results = load_results()
+    if not results:
+        await update.message.reply_text("📭 尚無任何完賽記錄（Bot 記錄從現在開始累積）")
+        return
+
+    arg = context.args[0].lower() if context.args else None
+    today = date.today().isoformat()
+
+    # 篩選
+    if arg == "today":
+        subset = [r for r in results if r.get("date") == today]
+        title = f"📊 今日弱隊戰績（{today}）"
+    elif arg in ("mlb", "kbo", "npb"):
+        subset = [r for r in results if r.get("league") == arg]
+        title = f"📊 {arg.upper()} 弱隊累積戰績"
+    else:
+        subset = results
+        title = "📊 全部弱隊累積戰績"
+
+    if not subset:
+        await update.message.reply_text(f"{title}\n\n暫無資料")
+        return
+
+    wins   = sum(1 for r in subset if r.get("underdog_won"))
+    losses = sum(1 for r in subset if r.get("underdog_won") is False)
+    total  = wins + losses
+    rate   = f"{wins/total*100:.1f}%" if total else "–"
+
+    lines = [title, f"勝負：{wins}勝{losses}敗  勝率：{rate}\n"]
+
+    # 依日期分組顯示詳細（最多顯示最近 20 場）
+    for r in subset[-20:]:
+        ud  = r.get("underdog", "?")
+        fav = r.get("favorite", "?")
+        ud_odds  = r.get("underdog_odds")
+        result = "✅" if r.get("underdog_won") else "❌"
+        a = r.get("away_team","?")
+        h = r.get("home_team","?")
+        s = f"{r.get('away_score',0)}:{r.get('home_score',0)}"
+        lg = r.get("league","?").upper()
+        t1 = "🔥" if r.get("ud_triggered") else ""
+        t2 = "🚀" if r.get("overtake") else ""
+        odds_str = f"({fmt_odds(ud_odds)})" if ud_odds else ""
+        lines.append(
+            f"{result}[{lg}]{r.get('date','')} {a} {s} {h}\n"
+            f"   弱隊：{ud}{odds_str} {t1}{t2}"
+        )
+
+    await update.message.reply_text("\n".join(lines))
+
+
 async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """手動查詢各聯盟目前比賽狀況，顯示是否已觸發條件。"""
     # 可指定聯盟：/check npb  或  /check（全部）
@@ -878,6 +968,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/status          — 目前狀態\n"
         "/today           — 今日全部賽程\n"
         "/check [聯盟]    — 即時查觸發狀況\n"
+        "/record [聯盟/today] — 弱隊買累積戰績\n"
         "/help            — 顯示說明\n\n"
         "觸發條件：\n"
         "🔥 弱隊先得分（正號賠率隊率先得分）\n"
@@ -898,6 +989,7 @@ def main():
     app.add_handler(CommandHandler("off",    cmd_off))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("today",  cmd_today))
+    app.add_handler(CommandHandler("record", cmd_record))
     app.add_handler(CommandHandler("check",  cmd_check))
     app.add_handler(CommandHandler("help",   cmd_help))
 
