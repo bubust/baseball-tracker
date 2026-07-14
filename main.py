@@ -167,6 +167,10 @@ PLAYSPORT_CODES: dict[str, dict] = {
     "kbo": PLAYSPORT_KBO_CODES,
 }
 
+YUNSAI_URL       = "https://www.sportslottery.com.tw/sports/baseball"
+YUNSAI_CACHE_TTL = 3600   # 1 小時快取
+_yunsai_cache: dict = {"_ts": 0, "data": {}}
+
 PINNACLE_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Accept":     "application/json",
@@ -637,6 +641,119 @@ async def fetch_playsport_scores(
     return games
 
 
+async def fetch_yunsai_handicap() -> dict[str, str]:
+    """
+    用 Playwright 從運彩棒球頁抓今日讓分盤。
+    回傳 {球隊中文名: "受讓" | "讓"} 字典。
+    有 1 小時快取避免重複開啟瀏覽器。
+    """
+    global _yunsai_cache
+    now = time.monotonic()
+    if now - _yunsai_cache["_ts"] < YUNSAI_CACHE_TTL and _yunsai_cache["data"]:
+        return _yunsai_cache["data"]
+
+    result: dict[str, str] = {}
+    try:
+        from playwright.async_api import async_playwright
+        from bs4 import BeautifulSoup
+
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--disable-setuid-sandbox",
+                    "--single-process",
+                ],
+            )
+            ctx = await browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                locale="zh-TW",
+                timezone_id="Asia/Taipei",
+            )
+            page = await ctx.new_page()
+            try:
+                await page.goto(YUNSAI_URL, wait_until="domcontentloaded", timeout=40000)
+                # 等 JS 渲染完成
+                await page.wait_for_timeout(6000)
+                html = await page.content()
+                log.info(f"[運彩] 頁面載入完成，大小：{len(html)} bytes")
+            except Exception as e:
+                log.error(f"[運彩] 頁面載入失敗：{e}")
+                html = await page.content()
+            finally:
+                await browser.close()
+
+        # 解析 受讓 / 讓
+        soup = BeautifulSoup(html, "lxml")
+        page_text = soup.get_text(separator="\n")
+        log.debug(f"[運彩] 頁面文字前1000字：\n{page_text[:1000]}")
+
+        # 策略：找含「受讓」或「讓」的文字區塊，往上找隊名
+        found_handicap = False
+        lines = [l.strip() for l in page_text.splitlines() if l.strip()]
+        for i, line in enumerate(lines):
+            if "受讓" in line or ("讓" in line and "受讓" not in line and len(line) < 20):
+                # 往前找隊名（通常在 1-3 行內）
+                for j in range(max(0, i - 3), i):
+                    team_candidate = lines[j]
+                    if 2 <= len(team_candidate) <= 10 and not any(
+                        c.isdigit() for c in team_candidate
+                    ):
+                        handicap_type = "受讓" if "受讓" in line else "讓"
+                        result[team_candidate] = handicap_type
+                        log.info(f"[運彩] {team_candidate} → {handicap_type}  (原文：{line})")
+                        found_handicap = True
+
+        if not found_handicap:
+            log.warning("[運彩] 未找到任何受讓/讓資料，可能是頁面結構不同或尚未開盤")
+
+    except ImportError:
+        log.error("[運彩] playwright 或 beautifulsoup4 未安裝")
+    except Exception as e:
+        log.error(f"[運彩] 爬蟲錯誤：{e}")
+
+    _yunsai_cache["data"] = result
+    _yunsai_cache["_ts"] = time.monotonic()
+    return result
+
+
+def determine_underdog_from_yunsai(
+    home_team: str, away_team: str, yunsai: dict[str, str]
+) -> Optional[tuple]:
+    """
+    用運彩讓分盤判斷強弱隊。
+    受讓方 = 弱隊（underdog）。
+    回傳 (underdog_name, favorite_name, underdog_is_home) 或 None。
+    """
+    def match(name: str) -> Optional[str]:
+        if name in yunsai:
+            return name
+        for k in yunsai:
+            if k in name or name in k:
+                return k
+        return None
+
+    h_key = match(home_team)
+    a_key = match(away_team)
+
+    if h_key and yunsai[h_key] == "受讓":
+        return (home_team, away_team, True)
+    if a_key and yunsai[a_key] == "受讓":
+        return (away_team, home_team, False)
+    if h_key and yunsai[h_key] == "讓":
+        return (away_team, home_team, False)
+    if a_key and yunsai[a_key] == "讓":
+        return (home_team, away_team, True)
+    return None
+
+
 def _attach_pinnacle_odds(ps_games: list[Game], pin_games: list[Game]):
     """將 Pinnacle 的賠率對應貼到 playsport 場次（以隊名模糊比對）。"""
     for pg in ps_games:
@@ -981,6 +1098,24 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
+async def cmd_yunsai(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """顯示目前從運彩抓到的讓分盤資料（debug 用）。強制重新爬取請加 refresh 參數。"""
+    if context.args and context.args[0].lower() == "refresh":
+        _yunsai_cache["_ts"] = 0   # 清快取
+    await update.message.reply_text("⏳ 正在開啟瀏覽器爬取運彩...")
+    yunsai = await fetch_yunsai_handicap()
+    if not yunsai:
+        await update.message.reply_text(
+            "❌ 運彩無資料\n可能原因：\n• 今日尚未開盤\n• 頁面結構有變\n• 請查 Railway log 確認"
+        )
+        return
+    lines = ["🏟 運彩讓分盤（今日）\n"]
+    for team, htype in yunsai.items():
+        icon = "⬆️" if htype == "受讓" else "⬇️"
+        lines.append(f"  {icon} {team} → {htype}")
+    await update.message.reply_text("\n".join(lines))
+
+
 async def cmd_record(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """顯示累積弱隊買贏/輸戰績。用法：/record [today|mlb|kbo|npb]"""
     results = load_results()
@@ -1126,6 +1261,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/today           — 今日全部賽程\n"
         "/check [聯盟]    — 即時查觸發狀況\n"
         "/record [聯盟/today] — 弱隊買累積戰績\n"
+        "/yunsai [refresh]    — 運彩讓分盤資料\n"
         "/help            — 顯示說明\n\n"
         "觸發條件：\n"
         "🔥 弱隊先得分（正號賠率隊率先得分）\n"
@@ -1146,6 +1282,7 @@ def main():
     app.add_handler(CommandHandler("off",    cmd_off))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("today",  cmd_today))
+    app.add_handler(CommandHandler("yunsai", cmd_yunsai))
     app.add_handler(CommandHandler("record", cmd_record))
     app.add_handler(CommandHandler("check",  cmd_check))
     app.add_handler(CommandHandler("help",   cmd_help))
