@@ -18,8 +18,84 @@ import os
 import re
 import time
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timezone, timedelta
 from typing import Optional
+
+TW_TZ = timezone(timedelta(hours=8))
+
+# ─── 球隊中文名對照表 ─────────────────────────────────────────────────────────
+TEAM_ZH: dict[str, str] = {
+    # MLB
+    "Arizona Diamondbacks":        "亞利桑那響尾蛇",
+    "Atlanta Braves":              "亞特蘭大勇士",
+    "Baltimore Orioles":           "巴爾的摩金鶯",
+    "Boston Red Sox":              "波士頓紅襪",
+    "Chicago White Sox":           "芝加哥白襪",
+    "Chicago Cubs":                "芝加哥小熊",
+    "Cincinnati Reds":             "辛辛那提紅人",
+    "Cleveland Guardians":         "克里夫蘭守護者",
+    "Colorado Rockies":            "科羅拉多洛磯",
+    "Detroit Tigers":              "底特律老虎",
+    "Houston Astros":              "休士頓太空人",
+    "Kansas City Royals":          "堪薩斯市皇家",
+    "Los Angeles Angels":          "洛杉磯天使",
+    "Los Angeles Dodgers":         "洛杉磯道奇",
+    "Miami Marlins":               "邁阿密馬林魚",
+    "Milwaukee Brewers":           "密爾瓦基釀酒人",
+    "Minnesota Twins":             "明尼蘇達雙城",
+    "New York Yankees":            "紐約洋基",
+    "New York Mets":               "紐約大都會",
+    "Athletics":                   "奧克蘭運動家",
+    "Oakland Athletics":           "奧克蘭運動家",
+    "Sacramento Athletics":        "沙加緬度運動家",
+    "Philadelphia Phillies":       "費城費城人",
+    "Pittsburgh Pirates":          "匹茲堡海盜",
+    "San Diego Padres":            "聖地牙哥教士",
+    "San Francisco Giants":        "舊金山巨人",
+    "Seattle Mariners":            "西雅圖水手",
+    "St. Louis Cardinals":         "聖路易紅雀",
+    "Tampa Bay Rays":              "坦帕灣光芒",
+    "Texas Rangers":               "德州遊騎兵",
+    "Toronto Blue Jays":           "多倫多藍鳥",
+    "Washington Nationals":        "華盛頓國民",
+    # KBO
+    "Doosan Bears":                "斗山熊",
+    "LG Twins":                    "LG雙子",
+    "Samsung Lions":               "三星獅",
+    "NC Dinos":                    "NC恐龍",
+    "KT Wiz":                      "KT巫師",
+    "SSG Landers":                 "SSG登陸者",
+    "Lotte Giants":                "樂天巨人",
+    "Kia Tigers":                  "起亞老虎",
+    "KIA Tigers":                  "起亞老虎",
+    "Hanwha Eagles":               "韓華鷹",
+    "Kiwoom Heroes":               "奇蒙英雄",
+    # NPB
+    "Yomiuri Giants":              "讀賣巨人",
+    "Hanshin Tigers":              "阪神虎",
+    "Hiroshima Toyo Carp":         "廣島東洋鯉魚",
+    "Hiroshima Carp":              "廣島鯉魚",
+    "Yokohama DeNA BayStars":      "橫濱DeNA海灣之星",
+    "DeNA BayStars":               "DeNA海灣之星",
+    "Tokyo Yakult Swallows":       "東京養樂多燕子",
+    "Yakult Swallows":             "養樂多燕子",
+    "Chunichi Dragons":            "中日龍",
+    "Hokkaido Nippon-Ham Fighters":"北海道日本火腿鬥士",
+    "Nippon-Ham Fighters":         "日本火腿鬥士",
+    "Tohoku Rakuten Golden Eagles":"東北樂天金鷹",
+    "Rakuten Eagles":              "樂天金鷹",
+    "Chiba Lotte Marines":         "千葉羅德水手",
+    "Lotte Marines":               "羅德水手",
+    "Orix Buffaloes":              "歐力士野牛",
+    "Fukuoka SoftBank Hawks":      "福岡軟銀鷹",
+    "SoftBank Hawks":              "軟銀鷹",
+    "Seibu Lions":                 "西武獅",
+}
+
+
+def team_zh(name: str) -> str:
+    """回傳中文隊名，找不到則回傳原名。"""
+    return TEAM_ZH.get(name, name)
 
 import httpx
 from telegram import Update
@@ -79,6 +155,7 @@ class Game:
     status:     str          # "live" | "final" | "scheduled"
     home_odds:  Optional[int] = None
     away_odds:  Optional[int] = None
+    game_time:  Optional[str] = None   # 台灣時間，格式 "HH:MM"
 
 
 # ─── 設定 & 狀態 I/O ─────────────────────────────────────────────────────────
@@ -158,6 +235,67 @@ async def fetch_mlb_games(client: httpx.AsyncClient) -> list[Game]:
                 away_score = int(away.get("score", 0) or 0),
                 inning     = int(ls.get("currentInning", 0) or 0),
                 status     = status,
+            ))
+    return games
+
+
+# ─── MLB Stats API（全部場次，含預定）──────────────────────────────────────
+async def fetch_mlb_all_games(client: httpx.AsyncClient) -> list[Game]:
+    """同 fetch_mlb_games，但包含 Scheduled/Pre-Game 狀態，並附遊戲時間（台灣時間）。"""
+    today = date.today().isoformat()
+    try:
+        r = await client.get(
+            f"{MLB_API_BASE}/schedule",
+            params={"sportId": 1, "hydrate": "linescore", "date": today},
+            timeout=10,
+        )
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        log.error(f"[MLB] 全場次 API 錯誤：{e}")
+        return []
+
+    games: list[Game] = []
+    for date_entry in data.get("dates", []):
+        for g in date_entry.get("games", []):
+            code = g.get("status", {}).get("codedGameState", "")
+            if code in ("S", "P"):
+                status = "scheduled"
+            elif code in ("F", "O", "U", "C", "D"):
+                status = "final"
+            else:
+                status = "live"
+
+            ls    = g.get("linescore", {})
+            teams = g.get("teams", {})
+            home  = teams.get("home", {})
+            away  = teams.get("away", {})
+            h_name = home.get("team", {}).get("name", "")
+            a_name = away.get("team", {}).get("name", "")
+            if not h_name or not a_name:
+                continue
+
+            # 解析 UTC 時間 → 台灣時間
+            game_time_str = None
+            raw_time = g.get("gameDate", "")
+            if raw_time:
+                try:
+                    dt_utc = datetime.fromisoformat(raw_time.replace("Z", "+00:00"))
+                    dt_tw  = dt_utc.astimezone(TW_TZ)
+                    game_time_str = dt_tw.strftime("%H:%M")
+                except Exception:
+                    pass
+
+            games.append(Game(
+                game_id    = str(g["gamePk"]),
+                league     = "mlb",
+                home_team  = h_name,
+                away_team  = a_name,
+                home_score = int(home.get("score", 0) or 0),
+                away_score = int(away.get("score", 0) or 0),
+                inning     = int(ls.get("currentInning", 0) or 0),
+                status     = status,
+                game_time  = game_time_str,
             ))
     return games
 
@@ -309,6 +447,17 @@ async def fetch_pinnacle_games(client: httpx.AsyncClient, league: str) -> list[G
         is_settled = ev.get("isSettled", False)
         status = "final" if is_settled else ("live" if is_live else "scheduled")
 
+        # 開賽時間 → 台灣時間
+        game_time_str = None
+        raw_start = ev.get("startTime", "")
+        if raw_start:
+            try:
+                dt_utc = datetime.fromisoformat(raw_start.replace("Z", "+00:00"))
+                dt_tw  = dt_utc.astimezone(TW_TZ)
+                game_time_str = dt_tw.strftime("%H:%M")
+            except Exception:
+                pass
+
         # 賠率
         h_odds = a_odds = None
         mid = ev["id"]
@@ -331,6 +480,7 @@ async def fetch_pinnacle_games(client: httpx.AsyncClient, league: str) -> list[G
             status     = status,
             home_odds  = h_odds,
             away_odds  = a_odds,
+            game_time  = game_time_str,
         ))
 
     if games:
@@ -457,8 +607,8 @@ async def monitor_cycle(context: ContextTypes.DEFAULT_TYPE):
 
             if gid not in state:
                 state[gid] = {
-                    "underdog":             underdog,
-                    "favorite":             favorite,
+                    "underdog":             team_zh(underdog),
+                    "favorite":             team_zh(favorite),
                     "underdog_is_home":     ud_is_home,
                     "underdog_odds":        ud_odds,
                     "favorite_odds":        fav_odds,
@@ -562,12 +712,84 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
+async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    today = date.today().isoformat()
+    lines = [f"📅 今日賽程（{today}，台灣時間）\n"]
+
+    cfg = load_config()
+
+    LEAGUE_FLAG = {"mlb": "🇺🇸 MLB", "kbo": "🇰🇷 KBO", "npb": "🇯🇵 NPB"}
+
+    async with httpx.AsyncClient() as client:
+        # MLB
+        mlb_games: list[Game] = []
+        if cfg.get("mlb"):
+            mlb_games = await fetch_mlb_all_games(client)
+            mlb_odds  = await refresh_mlb_odds(client)
+            for g in mlb_games:
+                od = find_mlb_odds(g, mlb_odds)
+                if od:
+                    g.home_odds = od["home_odds"]
+                    g.away_odds = od["away_odds"]
+
+        # KBO / NPB
+        kbo_games: list[Game] = []
+        npb_games: list[Game] = []
+        if cfg.get("kbo"):
+            kbo_games = await fetch_pinnacle_games(client, "kbo")
+        if cfg.get("npb"):
+            npb_games = await fetch_pinnacle_games(client, "npb")
+
+    league_groups = [
+        ("mlb", mlb_games),
+        ("kbo", kbo_games),
+        ("npb", npb_games),
+    ]
+
+    total = 0
+    for lg, games in league_groups:
+        if not games:
+            continue
+        # 依時間排序（無時間的排後面）
+        games_sorted = sorted(games, key=lambda g: g.game_time or "99:99")
+        lines.append(f"{LEAGUE_FLAG[lg]}（{len(games)} 場）")
+        for g in games_sorted:
+            time_str = g.game_time or "--:--"
+
+            if g.status == "scheduled":
+                status_str = "預定"
+            elif g.status == "live":
+                status_str = f"進行中 第{g.inning}局" if g.inning else "進行中"
+            else:
+                status_str = "已結束"
+
+            score_str = ""
+            if g.status in ("live", "final"):
+                score_str = f" {g.away_score}:{g.home_score}"
+
+            odds_str = ""
+            if g.home_odds is not None and g.away_odds is not None:
+                odds_str = f"  {fmt_odds(g.away_odds)}/{fmt_odds(g.home_odds)}"
+
+            away_zh = team_zh(g.away_team)
+            home_zh = team_zh(g.home_team)
+            lines.append(f"  {time_str} {away_zh} @ {home_zh}{score_str} [{status_str}]{odds_str}")
+        lines.append("")
+        total += len(games)
+
+    if total == 0:
+        lines.append("今日暫無賽事資料")
+
+    await update.message.reply_text("\n".join(lines))
+
+
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "⚾ 棒球追蹤器指令\n\n"
         "/on mlb|kbo|npb  — 開啟聯盟監控\n"
         "/off mlb|kbo|npb — 關閉聯盟監控\n"
         "/status          — 目前狀態\n"
+        "/today           — 今日全部賽程\n"
         "/help            — 顯示說明\n\n"
         "觸發條件：\n"
         "🔥 弱隊先得分（正號賠率隊率先得分）\n"
@@ -587,6 +809,7 @@ def main():
     app.add_handler(CommandHandler("on",     cmd_on))
     app.add_handler(CommandHandler("off",    cmd_off))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("today",  cmd_today))
     app.add_handler(CommandHandler("help",   cmd_help))
 
     app.job_queue.run_repeating(monitor_cycle, interval=POLL_INTERVAL, first=10)
