@@ -131,6 +131,42 @@ RESULTS_FILE = os.path.join(os.path.dirname(__file__), "results.json")
 POLL_INTERVAL  = 60      # 秒
 ODDS_CACHE_TTL = 6 * 3600  # 賠率快取 6 小時
 
+PLAYSPORT_BASE = "https://ls.playsport.cc/ls_json.php"
+PLAYSPORT_ALLIANCE_IDS = {"mlb": 1, "npb": 2, "kbo": 9}
+
+# playsport official_id 短碼 → 中文隊名
+PLAYSPORT_NPB_CODES: dict[str, str] = {
+    "Hawks":    "福岡軟銀鷹",
+    "Fighters": "北海道日本火腿鬥士",
+    "Giants":   "讀賣巨人",
+    "Swallows": "東京養樂多燕子",
+    "Tigers":   "阪神虎",
+    "Dragons":  "中日龍",
+    "DeNA":     "橫濱海灣之星",
+    "Carp":     "廣島東洋鯉魚",
+    "Orix":     "歐力士野牛",
+    "Rakuten":  "東北樂天金鷹",
+    "Marines":  "千葉羅德水手",
+    "Lions":    "西武獅",
+    "Buffaloes":"歐力士野牛",
+}
+PLAYSPORT_KBO_CODES: dict[str, str] = {
+    "Bears":    "斗山熊",
+    "Twins":    "LG雙子",
+    "Lions":    "三星獅",
+    "Dinos":    "NC恐龍",
+    "Wiz":      "KT巫師",
+    "Landers":  "SSG登陸者",
+    "Giants":   "樂天巨人",
+    "Tigers":   "起亞老虎",
+    "Eagles":   "韓華鷹",
+    "Heroes":   "奇蒙英雄",
+}
+PLAYSPORT_CODES: dict[str, dict] = {
+    "npb": PLAYSPORT_NPB_CODES,
+    "kbo": PLAYSPORT_KBO_CODES,
+}
+
 PINNACLE_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Accept":     "application/json",
@@ -512,6 +548,110 @@ async def fetch_pinnacle_games(client: httpx.AsyncClient, league: str) -> list[G
     return games
 
 
+# ─── Playsport.cc（補充比分，Pinnacle 結算後仍可查）──────────────────────────
+async def fetch_playsport_scores(
+    client: httpx.AsyncClient, league: str, gamedate: Optional[str] = None
+) -> list[Game]:
+    """
+    從 playsport.cc JSON API 取得 NPB/KBO 比分（含已結束場次）。
+    gamedate 格式：'YYYYMMDD'，預設為今天。
+    """
+    aid = PLAYSPORT_ALLIANCE_IDS.get(league)
+    if not aid:
+        return []
+    if not gamedate:
+        gamedate = date.today().strftime("%Y%m%d")
+
+    try:
+        r = await client.get(
+            PLAYSPORT_BASE,
+            params={"alliance": aid, "gamedate": gamedate},
+            headers={"Referer": f"https://www.playsport.cc/livescore/{aid}",
+                     "User-Agent": "Mozilla/5.0"},
+            timeout=10,
+        )
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        log.error(f"[{league.upper()}] Playsport API 錯誤：{e}")
+        return []
+
+    code_map = PLAYSPORT_CODES.get(league, {})
+    games: list[Game] = []
+
+    for gid_str, gdata in data.items():
+        if gid_str in ("use_memcache", "timestamp"):
+            continue
+        if not isinstance(gdata, dict):
+            continue
+
+        official_id = gdata.get("official_id", "")
+        # 格式：NPB_YYYYMMDD_Away@Home_HHMM
+        try:
+            parts    = official_id.split("_")
+            teams_str = parts[2]            # "Away@Home"
+            away_code, home_code = teams_str.split("@")
+        except Exception:
+            continue
+
+        away_name = code_map.get(away_code, away_code)
+        home_name = code_map.get(home_code, home_code)
+
+        scores = gdata.get("r", ["0", "0"])
+        try:
+            away_score = int(scores[0])
+            home_score = int(scores[1])
+        except Exception:
+            away_score = home_score = 0
+
+        ss = str(gdata.get("ss", "0"))
+        if ss == "2":
+            status = "final"
+        elif ss == "1":
+            status = "live"
+        else:
+            status = "scheduled"
+
+        gs    = gdata.get("gs", {})
+        inning = int(gs.get("i", 0) or 0)
+
+        # 開賽時間 → 台灣時間（dateon 已是 UTC+8？直接取 HH:MM）
+        game_time_str = None
+        dateon = gdata.get("dateon", "")
+        if dateon and len(dateon) >= 16:
+            game_time_str = dateon[11:16]
+
+        games.append(Game(
+            game_id    = f"ps_{league}_{gid_str}",
+            league     = league,
+            home_team  = home_name,
+            away_team  = away_name,
+            home_score = home_score,
+            away_score = away_score,
+            inning     = inning,
+            status     = status,
+            game_time  = game_time_str,
+        ))
+
+    log.info(f"[{league.upper()}] Playsport：{len(games)} 場賽事")
+    return games
+
+
+def _attach_pinnacle_odds(ps_games: list[Game], pin_games: list[Game]):
+    """將 Pinnacle 的賠率對應貼到 playsport 場次（以隊名模糊比對）。"""
+    for pg in ps_games:
+        if pg.home_odds is not None:
+            continue
+        h_norm = normalize(pg.home_team)
+        a_norm = normalize(pg.away_team)
+        for pp in pin_games:
+            if (normalize(pp.home_team) in h_norm or h_norm in normalize(pp.home_team)) and \
+               (normalize(pp.away_team) in a_norm or a_norm in normalize(pp.away_team)):
+                pg.home_odds = pp.home_odds
+                pg.away_odds = pp.away_odds
+                break
+
+
 # ─── 強弱判斷 ────────────────────────────────────────────────────────────────
 def determine_sides(game: Game, odds: Optional[dict]) -> Optional[tuple]:
     """
@@ -775,13 +915,24 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     g.home_odds = od["home_odds"]
                     g.away_odds = od["away_odds"]
 
-        # KBO / NPB
+        # KBO / NPB：Playsport 提供完整比分（含已結束），Pinnacle 補賠率
         kbo_games: list[Game] = []
         npb_games: list[Game] = []
         if cfg.get("kbo"):
-            kbo_games = await fetch_pinnacle_games(client, "kbo")
+            kbo_games = await fetch_playsport_scores(client, "kbo")
+            if not kbo_games:  # 備用：Pinnacle
+                kbo_games = await fetch_pinnacle_games(client, "kbo")
+            else:
+                # 從 Pinnacle 拿賠率，對應回 playsport 場次
+                pin_kbo = await fetch_pinnacle_games(client, "kbo")
+                _attach_pinnacle_odds(kbo_games, pin_kbo)
         if cfg.get("npb"):
-            npb_games = await fetch_pinnacle_games(client, "npb")
+            npb_games = await fetch_playsport_scores(client, "npb")
+            if not npb_games:
+                npb_games = await fetch_pinnacle_games(client, "npb")
+            else:
+                pin_npb = await fetch_pinnacle_games(client, "npb")
+                _attach_pinnacle_odds(npb_games, pin_npb)
 
     league_groups = [
         ("mlb", mlb_games),
@@ -913,7 +1064,13 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
             all_games.extend(mlb_games)
         for lg in ["kbo", "npb"]:
             if lg in leagues:
-                all_games.extend(await fetch_pinnacle_games(client, lg))
+                ps_games = await fetch_playsport_scores(client, lg)
+                if ps_games:
+                    pin_games = await fetch_pinnacle_games(client, lg)
+                    _attach_pinnacle_odds(ps_games, pin_games)
+                    all_games.extend(ps_games)
+                else:
+                    all_games.extend(await fetch_pinnacle_games(client, lg))
 
     if not all_games:
         lines.append("目前無進行中賽事")
