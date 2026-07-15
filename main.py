@@ -1035,28 +1035,34 @@ VALID_LEAGUES = {"mlb", "kbo", "npb"}
 
 
 async def cmd_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cfg = load_config()
     if not context.args:
-        await update.message.reply_text("用法：/on mlb|kbo|npb")
+        for lg in VALID_LEAGUES:
+            cfg[lg] = True
+        save_config(cfg)
+        await update.message.reply_text("✅ 全部聯盟（MLB/KBO/NPB）監控已開啟")
         return
     lg = context.args[0].lower()
     if lg not in VALID_LEAGUES:
         await update.message.reply_text(f"❌ 未知聯盟：{lg}")
         return
-    cfg = load_config()
     cfg[lg] = True
     save_config(cfg)
     await update.message.reply_text(f"✅ {lg.upper()} 監控已開啟")
 
 
 async def cmd_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cfg = load_config()
     if not context.args:
-        await update.message.reply_text("用法：/off mlb|kbo|npb")
+        for lg in VALID_LEAGUES:
+            cfg[lg] = False
+        save_config(cfg)
+        await update.message.reply_text("⛔ 全部聯盟（MLB/KBO/NPB）監控已關閉")
         return
     lg = context.args[0].lower()
     if lg not in VALID_LEAGUES:
         await update.message.reply_text(f"❌ 未知聯盟：{lg}")
         return
-    cfg = load_config()
     cfg[lg] = False
     save_config(cfg)
     await update.message.reply_text(f"⛔ {lg.upper()} 監控已關閉")
@@ -1298,7 +1304,11 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status_str = "已結束" if game.status == "final" else f"進行中{inn_str}"
 
         if sides is None:
-            lines.append(f"[{lg_tag}] {away_zh} {score_str} {home_zh} [{status_str}] — 無賠率，跳過")
+            if game.home_odds is not None and game.away_odds is not None:
+                odds_raw = f"客{fmt_odds(game.away_odds)}/主{fmt_odds(game.home_odds)}"
+                lines.append(f"[{lg_tag}] {away_zh} {score_str} {home_zh} [{status_str}] — 賠率相等（{odds_raw}），無法判斷強弱")
+            else:
+                lines.append(f"[{lg_tag}] {away_zh} {score_str} {home_zh} [{status_str}] — 無賠率（Pinnacle 尚未開盤）")
             continue
 
         underdog, favorite, ud_odds, fav_odds, ud_is_home = sides
@@ -1347,11 +1357,13 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "⚾ 棒球追蹤器指令\n\n"
-        "/on mlb|kbo|npb  — 開啟聯盟監控\n"
-        "/off mlb|kbo|npb — 關閉聯盟監控\n"
+        "/on          — 開啟全部聯盟監控\n"
+        "/on mlb|kbo|npb  — 開啟指定聯盟\n"
+        "/off         — 關閉全部聯盟監控\n"
+        "/off mlb|kbo|npb — 關閉指定聯盟\n"
         "/status          — 目前狀態\n"
         "/today           — 今日全部賽程\n"
-        "/check [聯盟]    — 即時查觸發狀況\n"
+        "/check [聯盟]    — 即時查觸發狀況（含賠率）\n"
         "/record [聯盟/today] — 弱隊買累積戰績\n"
         "/yunsai [refresh]    — 運彩讓分盤資料\n"
         "/help            — 顯示說明\n\n"
