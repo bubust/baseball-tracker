@@ -801,6 +801,22 @@ def _zh_match(a: str, b: str) -> bool:
     return a == b or a in b or b in a
 
 
+def _update_pre_odds_cache(pin_games: list[Game], pre_odds: dict) -> None:
+    """把 Pinnacle 即時有效賠率存入預快取（key = 主隊中文|客隊中文）。"""
+    today = date.today().isoformat()
+    for pp in pin_games:
+        if pp.home_odds is None or pp.away_odds is None:
+            continue
+        h_zh = team_zh(pp.home_team)
+        a_zh = team_zh(pp.away_team)
+        pre_odds[f"{h_zh}|{a_zh}"] = {
+            "home_odds":   pp.home_odds,
+            "away_odds":   pp.away_odds,
+            "home_spread": pp.home_spread,
+            "date":        today,
+        }
+
+
 def _attach_pinnacle_odds(
     ps_games: list[Game],
     pin_games: list[Game],
@@ -809,25 +825,10 @@ def _attach_pinnacle_odds(
     """
     將 Pinnacle 的賠率對應貼到 playsport 場次。
     策略：
-      1. Pinnacle 即時資料（模糊中文隊名比對）
-      2. Pinnacle 盤口暫停時，從預快取（pre_odds）撈賽前賠率
-    並將本次有效 Pinnacle 賠率寫入預快取供下次備用。
+      1. Pinnacle 即時資料（模糊中文隊名比對，同時支援主客場順序相反）
+      2. Pinnacle 盤口暫停時，從預快取（pre_odds）撈賽前賠率（同樣支援逆向）
     """
     today = date.today().isoformat()
-
-    # ── 先把 Pinnacle 即時有效賠率更新到預快取 ──────────────────────────────
-    if pre_odds is not None:
-        for pp in pin_games:
-            if pp.home_odds is None or pp.away_odds is None:
-                continue
-            h_zh = team_zh(pp.home_team)
-            a_zh = team_zh(pp.away_team)
-            pre_odds[f"{h_zh}|{a_zh}"] = {
-                "home_odds":   pp.home_odds,
-                "away_odds":   pp.away_odds,
-                "home_spread": pp.home_spread,
-                "date":        today,
-            }
 
     for pg in ps_games:
         if pg.home_odds is not None:
@@ -835,7 +836,7 @@ def _attach_pinnacle_odds(
         pg_h = pg.home_team   # playsport 已是中文
         pg_a = pg.away_team
 
-        # 1️⃣ Pinnacle 即時資料（模糊比對）
+        # 1️⃣ Pinnacle 即時資料（模糊比對，支援主客場逆向）
         matched = False
         for pp in pin_games:
             pp_h = team_zh(pp.home_team)
@@ -847,6 +848,7 @@ def _attach_pinnacle_odds(
                 matched = True
                 break
             elif _zh_match(pg_h, pp_a) and _zh_match(pg_a, pp_h):
+                # 主客場相反 → 對調賠率，讓分值取反
                 pg.home_odds   = pp.away_odds
                 pg.away_odds   = pp.home_odds
                 pg.home_spread = (-pp.home_spread if pp.home_spread is not None else None)
@@ -856,7 +858,8 @@ def _attach_pinnacle_odds(
         if matched or pre_odds is None:
             continue
 
-        # 2️⃣ Pinnacle 盤口暫停 → 從預快取補賠率
+        # 2️⃣ Pinnacle 盤口暫停 → 從預快取補賠率（同樣支援逆向）
+        cache_found = False
         for cache_key, pm in pre_odds.items():
             if pm.get("date") != today:
                 continue
@@ -869,8 +872,18 @@ def _attach_pinnacle_odds(
                 pg.away_odds   = pm.get("away_odds")
                 pg.home_spread = pm.get("home_spread")
                 log.info(f"[預快取] {pg_h} vs {pg_a} 使用賽前快取賠率")
+                cache_found = True
                 break
-        else:
+            elif _zh_match(pg_h, ca) and _zh_match(pg_a, ch):
+                # 快取方向與 Playsport 相反 → 對調
+                pg.home_odds   = pm.get("away_odds")
+                pg.away_odds   = pm.get("home_odds")
+                h_sp = pm.get("home_spread")
+                pg.home_spread = (-h_sp if h_sp is not None else None)
+                log.info(f"[預快取逆向] {pg_h} vs {pg_a} 使用賽前快取賠率（主客對調）")
+                cache_found = True
+                break
+        if not cache_found:
             log.warning(f"[無賠率] {pg_h} vs {pg_a} — Pinnacle 無即時賠率，快取亦無今日資料")
 
 
@@ -927,8 +940,7 @@ def check_triggers(game: Game, gs: dict) -> list[str]:
     inning     = game.inning
 
     # 讓分顯示（若有 spread 資料）
-    spread_val  = gs.get("home_spread")
-    ud_is_home2 = gs["underdog_is_home"]
+    spread_val = gs.get("home_spread")
     if spread_val is not None:
         pts = abs(spread_val)
         spread_str = f"受讓{pts:.1f}分" if spread_val != 0 else ""
@@ -998,13 +1010,13 @@ async def monitor_cycle(context: ContextTypes.DEFAULT_TYPE):
             all_games.extend(mlb_games)
 
         # KBO / NPB：Playsport 提供完整比分（含已結束），Pinnacle 補賠率
-        # 先載入預快取（賽中 Pinnacle 暫停盤口時備用）
         pre_odds = load_pre_odds()
         for lg in ["kbo", "npb"]:
             if config.get(lg):
-                # 先抓 Pinnacle（含預定場次賠率），順便更新預快取
                 pin_games = await fetch_pinnacle_games(client, lg)
-                ps_games  = await fetch_playsport_scores(client, lg)
+                # 不論 Playsport 是否有資料，先把 Pinnacle 賠率存進快取
+                _update_pre_odds_cache(pin_games, pre_odds)
+                ps_games = await fetch_playsport_scores(client, lg)
                 if ps_games:
                     _attach_pinnacle_odds(ps_games, pin_games, pre_odds)
                     all_games.extend(ps_games)
@@ -1186,6 +1198,7 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
         npb_games: list[Game] = []
         if cfg.get("kbo"):
             pin_kbo   = await fetch_pinnacle_games(client, "kbo")
+            _update_pre_odds_cache(pin_kbo, pre_odds)
             kbo_games = await fetch_playsport_scores(client, "kbo")
             if kbo_games:
                 _attach_pinnacle_odds(kbo_games, pin_kbo, pre_odds)
@@ -1193,6 +1206,7 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 kbo_games = pin_kbo
         if cfg.get("npb"):
             pin_npb   = await fetch_pinnacle_games(client, "npb")
+            _update_pre_odds_cache(pin_npb, pre_odds)
             npb_games = await fetch_playsport_scores(client, "npb")
             if npb_games:
                 _attach_pinnacle_odds(npb_games, pin_npb, pre_odds)
@@ -1349,6 +1363,7 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for lg in ["kbo", "npb"]:
             if lg in leagues:
                 pin_games = await fetch_pinnacle_games(client, lg)
+                _update_pre_odds_cache(pin_games, pre_odds)
                 ps_games  = await fetch_playsport_scores(client, lg)
                 if ps_games:
                     _attach_pinnacle_odds(ps_games, pin_games, pre_odds)
@@ -1426,6 +1441,75 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
+async def cmd_triggers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """顯示今日已觸發的比賽記錄（弱隊先得分 / 反超）。"""
+    today = date.today().isoformat()
+    lines = [f"⚡ 今日觸發紀錄（{today}）\n"]
+
+    LEAGUE_FLAG = {"mlb": "🇺🇸 MLB", "kbo": "🇰🇷 KBO", "npb": "🇯🇵 NPB"}
+    triggered: list[dict] = []
+
+    # 1. 從 results.json（已結束場次）
+    for r in load_results():
+        if r.get("date") != today:
+            continue
+        if r.get("ud_triggered") or r.get("overtake"):
+            triggered.append({
+                "league":      r.get("league", ""),
+                "away":        r.get("away_team", "?"),
+                "home":        r.get("home_team", "?"),
+                "away_score":  r.get("away_score", 0),
+                "home_score":  r.get("home_score", 0),
+                "underdog":    r.get("underdog", "?"),
+                "ud_trig":     r.get("ud_triggered", False),
+                "overtake":    r.get("overtake", False),
+                "status":      "final",
+            })
+
+    # 2. 從 state（進行中場次）
+    for gs in load_state().values():
+        if gs.get("date") != today:
+            continue
+        if gs.get("status") == "final":
+            continue   # 已結束的已在 results 裡
+        if gs.get("first_score_notified") or gs.get("overtake_notified"):
+            triggered.append({
+                "league":    gs.get("league", ""),
+                "away":      None,
+                "home":      None,
+                "underdog":  gs.get("underdog", "?"),
+                "favorite":  gs.get("favorite", "?"),
+                "ud_trig":   gs.get("first_score_notified", False),
+                "overtake":  gs.get("overtake_notified", False),
+                "status":    "live",
+            })
+
+    if not triggered:
+        lines.append("今日暫無觸發記錄")
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    for lg in ["npb", "kbo", "mlb"]:
+        items = [t for t in triggered if t["league"] == lg]
+        if not items:
+            continue
+        lines.append(LEAGUE_FLAG.get(lg, lg.upper()))
+        for t in items:
+            t1 = "🔥先得分 " if t["ud_trig"] else ""
+            t2 = "🚀反超 " if t["overtake"] else ""
+            ud = t["underdog"]
+            status_str = "已結束" if t["status"] == "final" else "進行中"
+            if t["away"] is not None:
+                score = f"{t['away_score']}:{t['home_score']}"
+                lines.append(f"  {t1}{t2}{t['away']} {score} {t['home']} [{status_str}]  弱隊:{ud}")
+            else:
+                lines.append(f"  {t1}{t2}{ud} vs {t['favorite']} [{status_str}]")
+        lines.append("")
+
+    lines.append(f"共 {len(triggered)} 筆觸發")
+    await update.message.reply_text("\n".join(lines))
+
+
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "⚾ 棒球追蹤器指令\n\n"
@@ -1436,6 +1520,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/status          — 目前狀態\n"
         "/today           — 今日全部賽程\n"
         "/check [聯盟]    — 即時查觸發狀況（含賠率）\n"
+        "/triggers        — 今日已觸發比賽一覽\n"
         "/record [聯盟/today] — 弱隊買累積戰績\n"
         "/yunsai [refresh]    — 運彩讓分盤資料\n"
         "/help            — 顯示說明\n\n"
@@ -1460,8 +1545,9 @@ def main():
     app.add_handler(CommandHandler("today",  cmd_today))
     app.add_handler(CommandHandler("yunsai", cmd_yunsai))
     app.add_handler(CommandHandler("record", cmd_record))
-    app.add_handler(CommandHandler("check",  cmd_check))
-    app.add_handler(CommandHandler("help",   cmd_help))
+    app.add_handler(CommandHandler("check",    cmd_check))
+    app.add_handler(CommandHandler("triggers", cmd_triggers))
+    app.add_handler(CommandHandler("help",     cmd_help))
 
     app.job_queue.run_repeating(monitor_cycle, interval=POLL_INTERVAL, first=10)
 
