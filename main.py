@@ -887,6 +887,112 @@ def _attach_pinnacle_odds(
             log.warning(f"[無賠率] {pg_h} vs {pg_a} — Pinnacle 無即時賠率，快取亦無今日資料")
 
 
+# ─── 回測工具 ────────────────────────────────────────────────────────────────
+
+def _parse_pinnacle_innings(participant: dict) -> list[int]:
+    """從 Pinnacle participant.stats 取出逐局得分（period 1..N，排除 period=0 總分）。"""
+    rows = [
+        (s["period"], int(s["score"]))
+        for s in participant.get("stats", [])
+        if s.get("period", 0) > 0 and "score" in s
+    ]
+    rows.sort()
+    return [runs for _, runs in rows]
+
+
+async def fetch_pinnacle_game_innings(
+    client: httpx.AsyncClient, league: str
+) -> dict[str, dict]:
+    """
+    從 Pinnacle 取得已結算場次的逐局比分。
+    key = "主隊中文|客隊中文"
+    val = {"home_innings": [r1,r2,...], "away_innings": [r1,r2,...]}
+    """
+    lid = PINNACLE_LEAGUE_IDS.get(league)
+    if not lid:
+        return {}
+    try:
+        r = await client.get(
+            f"{PINNACLE_BASE}/leagues/{lid}/matchups",
+            headers=PINNACLE_HEADERS, timeout=10
+        )
+        r.raise_for_status()
+        matchups = r.json()
+    except Exception as e:
+        log.error(f"[{league.upper()}] Pinnacle innings 錯誤：{e}")
+        return {}
+
+    result: dict[str, dict] = {}
+    for ev in matchups:
+        if ev.get("type") != "matchup" or not ev.get("isSettled", False):
+            continue
+        parts = ev.get("participants", [])
+        home_p = next((p for p in parts if p.get("alignment") == "home"), None)
+        away_p = next((p for p in parts if p.get("alignment") == "away"), None)
+        if not home_p or not away_p:
+            continue
+
+        h_zh = team_zh(home_p.get("name", ""))
+        a_zh = team_zh(away_p.get("name", ""))
+        h_inn = _parse_pinnacle_innings(home_p)
+        a_inn = _parse_pinnacle_innings(away_p)
+        if not h_inn and not a_inn:
+            continue
+
+        result[f"{h_zh}|{a_zh}"] = {
+            "home_innings": h_inn,
+            "away_innings": a_inn,
+        }
+    return result
+
+
+def simulate_triggers(
+    ud_is_home: bool,
+    home_innings: list[int],
+    away_innings: list[int],
+) -> tuple[bool, bool, Optional[int], Optional[int]]:
+    """
+    從逐局比分模擬觸發條件，完全對應 check_triggers 邏輯。
+    回傳 (first_score_trig, overtake_trig, first_score_inning, overtake_inning)
+    """
+    total_inn = max(len(home_innings), len(away_innings))
+    ud_total = fav_total = 0
+    first_score_checked = False
+    first_scorer = None
+    was_fav_leading = False
+    t1 = t2 = False
+    t1_inn = t2_inn = None
+
+    for i in range(total_inn):
+        h_runs = home_innings[i] if i < len(home_innings) else 0
+        a_runs = away_innings[i] if i < len(away_innings) else 0
+        ud_runs  = h_runs if ud_is_home else a_runs
+        fav_runs = a_runs if ud_is_home else h_runs
+        ud_total  += ud_runs
+        fav_total += fav_runs
+        inn = i + 1
+
+        if not first_score_checked and (ud_total > 0 or fav_total > 0):
+            first_score_checked = True
+            if ud_total > 0 and fav_total == 0:
+                first_scorer = "underdog"
+            elif fav_total > 0 and ud_total == 0:
+                first_scorer = "favorite"
+
+        if first_scorer == "underdog" and not t1:
+            t1 = True
+            t1_inn = inn
+
+        if fav_total > ud_total:
+            was_fav_leading = True
+
+        if was_fav_leading and ud_total > fav_total and not t2:
+            t2 = True
+            t2_inn = inn
+
+    return t1, t2, t1_inn, t2_inn
+
+
 # ─── 強弱判斷 ────────────────────────────────────────────────────────────────
 def determine_sides(game: Game, odds: Optional[dict]) -> Optional[tuple]:
     """
@@ -1510,6 +1616,148 @@ async def cmd_triggers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
+async def cmd_backtest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /backtest [YYYYMMDD]
+    用 Pinnacle 逐局比分回測今日（或指定日期）KBO/NPB 場次，
+    驗證弱隊先得分 / 反超觸發條件。
+    """
+    # ── 解析日期參數 ──────────────────────────────────────────────
+    args = context.args or []
+    if args:
+        raw = args[0].strip()
+        try:
+            dt = datetime.strptime(raw, "%Y%m%d").date()
+        except ValueError:
+            await update.message.reply_text("格式錯誤，請用 /backtest YYYYMMDD")
+            return
+    else:
+        dt = date.today()
+
+    date_str   = dt.isoformat()                  # 2025-07-15
+    ps_gamedate = dt.strftime("%Y%m%d")          # 20250715
+
+    await update.message.reply_text(f"🔍 回測 {date_str} 中，請稍候…")
+
+    lines = [f"📊 回測結果：{date_str}\n"]
+    LEAGUE_FLAG = {"kbo": "🇰🇷 KBO", "npb": "🇯🇵 NPB"}
+    g_total = t1_total = t2_total = 0
+
+    async with httpx.AsyncClient() as client:
+        for lg in ["kbo", "npb"]:
+            # 1. 取 Pinnacle 賠率（也順便更新 pre_odds cache）
+            pre_odds = load_pre_odds()
+            pin_games = await fetch_pinnacle_games(client, lg)
+            _update_pre_odds_cache(pin_games, pre_odds)
+            save_pre_odds(pre_odds)
+
+            # 2. 取 Pinnacle 逐局比分（只有 isSettled=True 的場次）
+            inning_map = await fetch_pinnacle_game_innings(client, lg)
+
+            # 3. 取 Playsport 歷史比分
+            ps_games = await fetch_playsport_scores(client, lg, gamedate=ps_gamedate)
+            if not ps_games:
+                continue
+
+            # 4. 附加賠率
+            _attach_pinnacle_odds(ps_games, pin_games, pre_odds)
+
+            # 5. 只分析已結束場次
+            finished = [g for g in ps_games if g.status == "final"]
+            if not finished:
+                continue
+
+            lines.append(LEAGUE_FLAG.get(lg, lg.upper()))
+
+            for g in finished:
+                # 判斷強弱
+                sides = determine_sides(g, None)
+                if not sides:
+                    lines.append(f"  ❔ {g.away_team} vs {g.home_team}  [無賠率，跳過]")
+                    continue
+
+                ud_name, fav_name, ud_odds, fav_odds, ud_is_home = sides
+
+                # 在 inning_map 裡找對應逐局比分（雙向模糊比對）
+                inn_data = None
+                for key, val in inning_map.items():
+                    parts = key.split("|")
+                    if len(parts) != 2:
+                        continue
+                    k_home, k_away = parts[0], parts[1]
+                    if _zh_match(g.home_team, k_home) and _zh_match(g.away_team, k_away):
+                        inn_data = val
+                        break
+                    if _zh_match(g.home_team, k_away) and _zh_match(g.away_team, k_home):
+                        # 方向相反，交換
+                        inn_data = {
+                            "home_innings": val["away_innings"],
+                            "away_innings": val["home_innings"],
+                        }
+                        break
+
+                if not inn_data:
+                    lines.append(
+                        f"  ❔ {g.away_team} {g.away_score}:{g.home_score} {g.home_team}"
+                        f"  [無逐局資料]  弱:{ud_name}"
+                    )
+                    continue
+
+                # 模擬觸發
+                t1, t2, t1_inn, t2_inn = simulate_triggers(
+                    ud_is_home,
+                    inn_data["home_innings"],
+                    inn_data["away_innings"],
+                )
+
+                g_total  += 1
+                t1_total += int(t1)
+                t2_total += int(t2)
+
+                icon = "✅" if (t1 or t2) else "➖"
+                t1_str = f"🔥{t1_inn}局" if t1 else ""
+                t2_str = f"🚀{t2_inn}局" if t2 else ""
+                trig_str = " ".join(filter(None, [t1_str, t2_str])) or "無觸發"
+
+                # 顯示賠率（美式）
+                ud_odds_str  = f"+{ud_odds}"  if ud_odds  >= 0 else str(ud_odds)
+                fav_odds_str = f"+{fav_odds}" if fav_odds >= 0 else str(fav_odds)
+
+                lines.append(
+                    f"  {icon} {g.away_team} {g.away_score}:{g.home_score} {g.home_team}"
+                    f"  弱:{ud_name}({ud_odds_str}) {trig_str}"
+                )
+
+            lines.append("")
+
+    # 統計
+    lines.append(
+        f"共 {g_total} 場有效  /  🔥先得分 {t1_total} 場  /  🚀反超 {t2_total} 場"
+    )
+    if g_total > 0:
+        lines.append(
+            f"先得分率 {t1_total/g_total*100:.0f}%  /  反超率 {t2_total/g_total*100:.0f}%"
+        )
+
+    # 避免訊息過長（Telegram 上限 4096）
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        chunks = []
+        cur = ""
+        for line in lines:
+            if len(cur) + len(line) + 1 > 3900:
+                chunks.append(cur)
+                cur = line
+            else:
+                cur += ("\n" if cur else "") + line
+        if cur:
+            chunks.append(cur)
+        for chunk in chunks:
+            await update.message.reply_text(chunk)
+    else:
+        await update.message.reply_text(text)
+
+
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "⚾ 棒球追蹤器指令\n\n"
@@ -1521,6 +1769,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/today           — 今日全部賽程\n"
         "/check [聯盟]    — 即時查觸發狀況（含賠率）\n"
         "/triggers        — 今日已觸發比賽一覽\n"
+        "/backtest [日期] — 回測弱隊觸發條件（KBO/NPB）\n"
         "/record [聯盟/today] — 弱隊買累積戰績\n"
         "/yunsai [refresh]    — 運彩讓分盤資料\n"
         "/help            — 顯示說明\n\n"
@@ -1547,6 +1796,7 @@ def main():
     app.add_handler(CommandHandler("record", cmd_record))
     app.add_handler(CommandHandler("check",    cmd_check))
     app.add_handler(CommandHandler("triggers", cmd_triggers))
+    app.add_handler(CommandHandler("backtest", cmd_backtest))
     app.add_handler(CommandHandler("help",     cmd_help))
 
     app.job_queue.run_repeating(monitor_cycle, interval=POLL_INTERVAL, first=10)
