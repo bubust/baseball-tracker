@@ -124,9 +124,10 @@ PINNACLE_LEAGUE_IDS = {
     "npb": 187703,
 }
 
-CONFIG_FILE  = os.path.join(os.path.dirname(__file__), "config.json")
-STATE_FILE   = os.path.join(os.path.dirname(__file__), "game_state.json")
-RESULTS_FILE = os.path.join(os.path.dirname(__file__), "results.json")
+CONFIG_FILE    = os.path.join(os.path.dirname(__file__), "config.json")
+STATE_FILE     = os.path.join(os.path.dirname(__file__), "game_state.json")
+RESULTS_FILE   = os.path.join(os.path.dirname(__file__), "results.json")
+PRE_ODDS_FILE  = os.path.join(os.path.dirname(__file__), "pre_odds_cache.json")
 
 POLL_INTERVAL  = 60      # 秒
 ODDS_CACHE_TTL = 6 * 3600  # 賠率快取 6 小時
@@ -248,6 +249,18 @@ def append_result(record: dict):
     results.append(record)
     with open(RESULTS_FILE, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2, ensure_ascii=False)
+
+
+def load_pre_odds() -> dict:
+    if os.path.exists(PRE_ODDS_FILE):
+        with open(PRE_ODDS_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def save_pre_odds(data: dict):
+    with open(PRE_ODDS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
 
 
 # ─── 工具函式 ────────────────────────────────────────────────────────────────
@@ -783,28 +796,82 @@ def determine_underdog_from_yunsai(
     return None
 
 
-def _attach_pinnacle_odds(ps_games: list[Game], pin_games: list[Game]):
-    """將 Pinnacle 的賠率對應貼到 playsport 場次（以中文隊名比對）。"""
+def _zh_match(a: str, b: str) -> bool:
+    """模糊比對中文隊名：完全相同 或 互相包含。"""
+    return a == b or a in b or b in a
+
+
+def _attach_pinnacle_odds(
+    ps_games: list[Game],
+    pin_games: list[Game],
+    pre_odds: Optional[dict] = None,
+):
+    """
+    將 Pinnacle 的賠率對應貼到 playsport 場次。
+    策略：
+      1. Pinnacle 即時資料（模糊中文隊名比對）
+      2. Pinnacle 盤口暫停時，從預快取（pre_odds）撈賽前賠率
+    並將本次有效 Pinnacle 賠率寫入預快取供下次備用。
+    """
+    today = date.today().isoformat()
+
+    # ── 先把 Pinnacle 即時有效賠率更新到預快取 ──────────────────────────────
+    if pre_odds is not None:
+        for pp in pin_games:
+            if pp.home_odds is None or pp.away_odds is None:
+                continue
+            h_zh = team_zh(pp.home_team)
+            a_zh = team_zh(pp.away_team)
+            pre_odds[f"{h_zh}|{a_zh}"] = {
+                "home_odds":   pp.home_odds,
+                "away_odds":   pp.away_odds,
+                "home_spread": pp.home_spread,
+                "date":        today,
+            }
+
     for pg in ps_games:
         if pg.home_odds is not None:
             continue
-        pg_home_zh = pg.home_team   # playsport 已是中文
-        pg_away_zh = pg.away_team
+        pg_h = pg.home_team   # playsport 已是中文
+        pg_a = pg.away_team
+
+        # 1️⃣ Pinnacle 即時資料（模糊比對）
+        matched = False
         for pp in pin_games:
-            pp_home_zh = team_zh(pp.home_team)   # Pinnacle 英文 → 中文
-            pp_away_zh = team_zh(pp.away_team)
-            if pg_home_zh == pp_home_zh and pg_away_zh == pp_away_zh:
-                # 主客場一致
+            pp_h = team_zh(pp.home_team)
+            pp_a = team_zh(pp.away_team)
+            if _zh_match(pg_h, pp_h) and _zh_match(pg_a, pp_a):
                 pg.home_odds   = pp.home_odds
                 pg.away_odds   = pp.away_odds
                 pg.home_spread = pp.home_spread
+                matched = True
                 break
-            elif pg_home_zh == pp_away_zh and pg_away_zh == pp_home_zh:
-                # 主客場相反 → 對調賠率，讓分值取反
+            elif _zh_match(pg_h, pp_a) and _zh_match(pg_a, pp_h):
                 pg.home_odds   = pp.away_odds
                 pg.away_odds   = pp.home_odds
                 pg.home_spread = (-pp.home_spread if pp.home_spread is not None else None)
+                matched = True
                 break
+
+        if matched or pre_odds is None:
+            continue
+
+        # 2️⃣ Pinnacle 盤口暫停 → 從預快取補賠率
+        for cache_key, pm in pre_odds.items():
+            if pm.get("date") != today:
+                continue
+            parts = cache_key.split("|", 1)
+            if len(parts) != 2:
+                continue
+            ch, ca = parts
+            if _zh_match(pg_h, ch) and _zh_match(pg_a, ca):
+                pg.home_odds   = pm.get("home_odds")
+                pg.away_odds   = pm.get("away_odds")
+                pg.home_spread = pm.get("home_spread")
+                log.info(f"[預快取] {pg_h} vs {pg_a} 使用賽前快取賠率")
+                break
+        else:
+            log.warning(f"[無賠率] {pg_h} vs {pg_a} — Pinnacle 無即時賠率，快取亦無今日資料")
 
 
 # ─── 強弱判斷 ────────────────────────────────────────────────────────────────
@@ -931,15 +998,19 @@ async def monitor_cycle(context: ContextTypes.DEFAULT_TYPE):
             all_games.extend(mlb_games)
 
         # KBO / NPB：Playsport 提供完整比分（含已結束），Pinnacle 補賠率
+        # 先載入預快取（賽中 Pinnacle 暫停盤口時備用）
+        pre_odds = load_pre_odds()
         for lg in ["kbo", "npb"]:
             if config.get(lg):
-                ps_games = await fetch_playsport_scores(client, lg)
+                # 先抓 Pinnacle（含預定場次賠率），順便更新預快取
+                pin_games = await fetch_pinnacle_games(client, lg)
+                ps_games  = await fetch_playsport_scores(client, lg)
                 if ps_games:
-                    pin_games = await fetch_pinnacle_games(client, lg)
-                    _attach_pinnacle_odds(ps_games, pin_games)
+                    _attach_pinnacle_odds(ps_games, pin_games, pre_odds)
                     all_games.extend(ps_games)
-                else:
-                    all_games.extend(await fetch_pinnacle_games(client, lg))
+                elif pin_games:
+                    all_games.extend(pin_games)
+        save_pre_odds(pre_odds)
 
         # 逐場處理
         for game in all_games:
@@ -1110,23 +1181,23 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     g.away_odds = od["away_odds"]
 
         # KBO / NPB：Playsport 提供完整比分（含已結束），Pinnacle 補賠率
+        pre_odds  = load_pre_odds()
         kbo_games: list[Game] = []
         npb_games: list[Game] = []
         if cfg.get("kbo"):
+            pin_kbo   = await fetch_pinnacle_games(client, "kbo")
             kbo_games = await fetch_playsport_scores(client, "kbo")
-            if not kbo_games:  # 備用：Pinnacle
-                kbo_games = await fetch_pinnacle_games(client, "kbo")
-            else:
-                # 從 Pinnacle 拿賠率，對應回 playsport 場次
-                pin_kbo = await fetch_pinnacle_games(client, "kbo")
-                _attach_pinnacle_odds(kbo_games, pin_kbo)
+            if kbo_games:
+                _attach_pinnacle_odds(kbo_games, pin_kbo, pre_odds)
+            elif pin_kbo:
+                kbo_games = pin_kbo
         if cfg.get("npb"):
+            pin_npb   = await fetch_pinnacle_games(client, "npb")
             npb_games = await fetch_playsport_scores(client, "npb")
-            if not npb_games:
-                npb_games = await fetch_pinnacle_games(client, "npb")
-            else:
-                pin_npb = await fetch_pinnacle_games(client, "npb")
-                _attach_pinnacle_odds(npb_games, pin_npb)
+            if npb_games:
+                _attach_pinnacle_odds(npb_games, pin_npb, pre_odds)
+            elif pin_npb:
+                npb_games = pin_npb
 
     league_groups = [
         ("mlb", mlb_games),
@@ -1274,15 +1345,16 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     g.home_odds = od["home_odds"]
                     g.away_odds = od["away_odds"]
             all_games.extend(mlb_games)
+        pre_odds = load_pre_odds()
         for lg in ["kbo", "npb"]:
             if lg in leagues:
-                ps_games = await fetch_playsport_scores(client, lg)
+                pin_games = await fetch_pinnacle_games(client, lg)
+                ps_games  = await fetch_playsport_scores(client, lg)
                 if ps_games:
-                    pin_games = await fetch_pinnacle_games(client, lg)
-                    _attach_pinnacle_odds(ps_games, pin_games)
+                    _attach_pinnacle_odds(ps_games, pin_games, pre_odds)
                     all_games.extend(ps_games)
-                else:
-                    all_games.extend(await fetch_pinnacle_games(client, lg))
+                elif pin_games:
+                    all_games.extend(pin_games)
 
     if not all_games:
         lines.append("目前無進行中賽事")
