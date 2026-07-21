@@ -216,7 +216,7 @@ def load_config() -> dict:
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, encoding="utf-8") as f:
             return json.load(f)
-    default = {"mlb": True, "kbo": True, "npb": True}
+    default = {"mlb": True, "kbo": True, "npb": True, "min_odds": 120}
     save_config(default)
     return default
 
@@ -1276,6 +1276,7 @@ async def monitor_cycle(context: ContextTypes.DEFAULT_TYPE):
         save_pre_odds(pre_odds)
 
         # 逐場處理
+        min_odds = config.get("min_odds", 120)
         for game in all_games:
             if game.status == "scheduled":
                 continue
@@ -1285,7 +1286,15 @@ async def monitor_cycle(context: ContextTypes.DEFAULT_TYPE):
                 continue
 
             underdog, favorite, ud_odds, fav_odds, ud_is_home = sides
+
+            # 閾值過濾：弱隊賠率未達標，跳過（僅針對新比賽）
             gid = game.game_id
+            if gid not in state and ud_odds is not None and ud_odds < min_odds:
+                log.debug(
+                    f"[略過] {game.league.upper()} {team_zh(underdog)} "
+                    f"賠率 {fmt_odds(ud_odds)} 未達閾值 +{min_odds}"
+                )
+                continue
 
             if gid not in state:
                 state[gid] = {
@@ -1505,14 +1514,16 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if home_zh == g.home_team:
                 log.debug(f"[未翻譯] {g.league.upper()} 主隊：{g.home_team!r}")
 
-            # 標記弱隊（🐣）
+            # 標記弱隊：🐣 = 達閾值（會追蹤），🔸 = 未達閾值（不追蹤）
+            min_odds = cfg.get("min_odds", 120)
             sides = determine_sides(g, None)
             if sides is not None:
-                _, _, _, _, ud_is_home = sides
+                _, _, ud_o, _, ud_is_home = sides
+                icon = "🐣" if (ud_o is None or ud_o >= min_odds) else "🔸"
                 if ud_is_home:
-                    home_zh = f"🐣{home_zh}"
+                    home_zh = f"{icon}{home_zh}"
                 else:
-                    away_zh = f"🐣{away_zh}"
+                    away_zh = f"{icon}{away_zh}"
 
             lines.append(f"  {time_str} {away_zh} @ {home_zh}{score_str} [{status_str}]{odds_str}")
         lines.append("")
@@ -1593,7 +1604,8 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for lg in ["mlb", "kbo", "npb"]:
         icon = "✅" if cfg.get(lg) else "⛔"
         status_parts.append(f"{icon}{lg.upper()}")
-    lines = [f"⚾ 棒球追蹤器  {'  '.join(status_parts)}", f"📅 {today}\n"]
+    min_odds = cfg.get("min_odds", 120)
+    lines = [f"⚾ 棒球追蹤器  {'  '.join(status_parts)}", f"📅 {today}  🐣閾值 +{min_odds}\n"]
 
     async with httpx.AsyncClient() as client:
         all_games: list[Game] = []
@@ -1837,18 +1849,53 @@ async def cmd_backtest(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text)
 
 
+async def cmd_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """查詢或設定弱隊賠率閾值。/threshold 或 /threshold 150"""
+    cfg = load_config()
+    current = cfg.get("min_odds", 120)
+
+    if not context.args:
+        await update.message.reply_text(
+            f"📊 目前弱隊賠率閾值：+{current}\n\n"
+            f"🐣 賠率 ≥ +{current} → 追蹤並通知\n"
+            f"🔸 賠率 < +{current} → 顯示但不追蹤\n\n"
+            f"修改：/threshold [數字]（例如 /threshold 150）"
+        )
+        return
+
+    try:
+        val = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ 請輸入整數，例如 /threshold 120")
+        return
+
+    if val < 0:
+        await update.message.reply_text("❌ 閾值必須為正整數（美式賠率正號部分）")
+        return
+
+    cfg["min_odds"] = val
+    save_config(cfg)
+    await update.message.reply_text(
+        f"✅ 閾值已更新：+{val}\n"
+        f"只追蹤弱隊賠率 ≥ +{val} 的比賽"
+    )
+
+
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "⚾ 棒球追蹤器指令\n\n"
-        "/on [mlb|kbo|npb]  — 開啟監控（不加參數 = 全開）\n"
-        "/off [mlb|kbo|npb] — 關閉監控（不加參數 = 全關）\n"
-        "/today             — 今日賽程 + 🐣弱隊標示\n"
-        "/check [聯盟]      — 監控狀態 + 即時觸發情況\n"
+        "/on [mlb|kbo|npb]   — 開啟監控（不加參數 = 全開）\n"
+        "/off [mlb|kbo|npb]  — 關閉監控（不加參數 = 全關）\n"
+        "/today              — 今日賽程 + 弱隊標示\n"
+        "/check [聯盟]       — 監控狀態 + 即時觸發情況\n"
+        "/threshold [數字]   — 查詢或設定弱隊賠率閾值（預設 +120）\n"
         "/record [聯盟/today] — 弱隊累積戰績\n"
         "/backtest [YYYYMMDD] — 回測觸發條件（KBO/NPB）\n"
-        "/help              — 顯示說明\n\n"
-        "🐣 = 弱隊（賠率正號/受讓方）\n"
-        "💪 = 強隊\n\n"
+        "/help               — 顯示說明\n\n"
+        "弱隊標示：\n"
+        "🐣 賠率達閾值 → 追蹤並通知\n"
+        "🔸 賠率未達閾值 → 顯示但不追蹤\n"
+        "💪 強隊\n\n"
         "觸發通知：\n"
         "🔥 弱隊先得分\n"
         "🚀 弱隊反超（強隊曾領先後被超越）\n"
@@ -1865,13 +1912,14 @@ def main():
     log.info("⚾ 棒球追蹤器啟動中...")
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("on",       cmd_on))
-    app.add_handler(CommandHandler("off",      cmd_off))
-    app.add_handler(CommandHandler("today",    cmd_today))
-    app.add_handler(CommandHandler("check",    cmd_check))
-    app.add_handler(CommandHandler("record",   cmd_record))
-    app.add_handler(CommandHandler("backtest", cmd_backtest))
-    app.add_handler(CommandHandler("help",     cmd_help))
+    app.add_handler(CommandHandler("on",        cmd_on))
+    app.add_handler(CommandHandler("off",       cmd_off))
+    app.add_handler(CommandHandler("today",     cmd_today))
+    app.add_handler(CommandHandler("check",     cmd_check))
+    app.add_handler(CommandHandler("threshold", cmd_threshold))
+    app.add_handler(CommandHandler("record",    cmd_record))
+    app.add_handler(CommandHandler("backtest",  cmd_backtest))
+    app.add_handler(CommandHandler("help",      cmd_help))
 
     app.job_queue.run_repeating(monitor_cycle, interval=POLL_INTERVAL, first=10)
 
