@@ -153,6 +153,7 @@ PLAYSPORT_NPB_CODES: dict[str, str] = {
     "Buffaloes":"歐力士野牛",
 }
 PLAYSPORT_KBO_CODES: dict[str, str] = {
+    # 完整名稱
     "Bears":    "斗山熊",
     "Twins":    "LG雙子",
     "Lions":    "三星獅",
@@ -163,12 +164,21 @@ PLAYSPORT_KBO_CODES: dict[str, str] = {
     "Tigers":   "起亞老虎",
     "Eagles":   "韓華鷹",
     "Heroes":   "奇蒙英雄",
+    # 縮寫 / 舊名
     "Kiwoom":   "奇蒙英雄",
     "Nexen":    "奇蒙英雄",
+    "NEXEN":    "奇蒙英雄",
     "NC":       "NC恐龍",
     "SSG":      "SSG登陸者",
     "KT":       "KT巫師",
     "LG":       "LG雙子",
+    # Playsport 大寫縮寫（實際 API 回傳值）
+    "LOTTE":    "樂天巨人",
+    "SAMSUNG":  "三星獅",
+    "KIA":      "起亞老虎",
+    "HANWHA":   "韓華鷹",
+    "DOOSAN":   "斗山熊",
+    "KIWOOM":   "奇蒙英雄",
 }
 PLAYSPORT_CODES: dict[str, dict] = {
     "npb": PLAYSPORT_NPB_CODES,
@@ -844,7 +854,8 @@ async def fetch_pinnacle_game_innings(
         r.raise_for_status()
         matchups = r.json()
     except Exception as e:
-        log.error(f"[{league.upper()}] Pinnacle innings 錯誤：{e}")
+        level = log.warning if "403" in str(e) else log.error
+        level(f"[{league.upper()}] Pinnacle innings 錯誤：{e}")
         return {}
 
     result: dict[str, dict] = {}
