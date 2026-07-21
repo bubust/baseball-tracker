@@ -128,6 +128,7 @@ CONFIG_FILE    = os.path.join(os.path.dirname(__file__), "config.json")
 STATE_FILE     = os.path.join(os.path.dirname(__file__), "game_state.json")
 RESULTS_FILE   = os.path.join(os.path.dirname(__file__), "results.json")
 PRE_ODDS_FILE  = os.path.join(os.path.dirname(__file__), "pre_odds_cache.json")
+SUMMARY_FILE   = os.path.join(os.path.dirname(__file__), "summary_sent.json")
 
 POLL_INTERVAL  = 60      # 秒
 ODDS_CACHE_TTL = 6 * 3600  # 賠率快取 6 小時
@@ -261,6 +262,18 @@ def load_pre_odds() -> dict:
 def save_pre_odds(data: dict):
     with open(PRE_ODDS_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def load_summary_sent() -> dict:
+    if os.path.exists(SUMMARY_FILE):
+        with open(SUMMARY_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def save_summary_sent(data: dict):
+    with open(SUMMARY_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
 
 
 # ─── 工具函式 ────────────────────────────────────────────────────────────────
@@ -485,16 +498,19 @@ def _apply_odds_api_to_games(games: list[Game], odds_cache: dict) -> None:
             continue
         h_zh = team_zh(g.home_team)
         a_zh = team_zh(g.away_team)
-        entry = odds_cache.get(f"{h_zh}|{a_zh}") or odds_cache.get(f"{a_zh}|{h_zh}")
-        if entry:
-            if f"{h_zh}|{a_zh}" in odds_cache:
-                g.home_odds = entry["home_odds"]
-                g.away_odds = entry["away_odds"]
-            else:
-                # 主客顛倒 → 對調
-                g.home_odds = entry["away_odds"]
-                g.away_odds = entry["home_odds"]
-            log.info(f"[Odds API 補充] {h_zh} vs {a_zh} 賠率 {g.home_odds}/{g.away_odds}")
+        key_normal  = f"{h_zh}|{a_zh}"
+        key_reverse = f"{a_zh}|{h_zh}"
+        if key_normal in odds_cache:
+            entry = odds_cache[key_normal]
+            g.home_odds = entry["home_odds"]
+            g.away_odds = entry["away_odds"]
+            log.info(f"[Odds API 補充] {h_zh} vs {a_zh}  {fmt_odds(g.home_odds)}/{fmt_odds(g.away_odds)}")
+        elif key_reverse in odds_cache:
+            entry = odds_cache[key_reverse]
+            # 主客顛倒 → 對調賠率
+            g.home_odds = entry["away_odds"]
+            g.away_odds = entry["home_odds"]
+            log.info(f"[Odds API 補充逆向] {h_zh} vs {a_zh}  {fmt_odds(g.home_odds)}/{fmt_odds(g.away_odds)}")
 
 
 def find_mlb_odds(game: Game, cache: dict) -> Optional[dict]:
@@ -1159,6 +1175,65 @@ def check_triggers(game: Game, gs: dict) -> list[str]:
     return msgs
 
 
+# ─── 每日結算 ────────────────────────────────────────────────────────────────
+def build_daily_summary(today: str) -> Optional[str]:
+    """
+    整理今日所有已結束場次的結算統計，回傳 Telegram 訊息字串。
+    若今日無任何完賽資料，回傳 None。
+    """
+    results = load_results()
+    today_results = [r for r in results if r.get("date") == today]
+    if not today_results:
+        return None
+
+    LEAGUE_FLAG = {"mlb": "🇺🇸MLB", "kbo": "🇰🇷KBO", "npb": "🇯🇵NPB"}
+
+    lines = [f"📊 今日弱隊結算報告（{today}）\n"]
+
+    total = len(today_results)
+    ud_wins   = sum(1 for r in today_results if r.get("underdog_won"))
+    ud_losses = total - ud_wins
+    triggered = [r for r in today_results if r.get("ud_triggered") or r.get("overtake")]
+
+    lines.append(f"共追蹤 {total} 場  |  弱隊 {ud_wins}勝{ud_losses}敗  |  觸發 {len(triggered)} 場")
+    lines.append("")
+
+    # 依聯盟分組
+    for lg in ["mlb", "kbo", "npb"]:
+        lg_results = [r for r in today_results if r.get("league") == lg]
+        if not lg_results:
+            continue
+        lg_wins = sum(1 for r in lg_results if r.get("underdog_won"))
+        lines.append(f"{LEAGUE_FLAG.get(lg, lg.upper())}  {lg_wins}勝{len(lg_results)-lg_wins}敗")
+        for r in lg_results:
+            ud      = r.get("underdog", "?")
+            fav     = r.get("favorite", "?")
+            ud_odds = r.get("underdog_odds")
+            away_s  = r.get("away_score", 0)
+            home_s  = r.get("home_score", 0)
+            away_t  = r.get("away_team", "?")
+            home_t  = r.get("home_team", "?")
+            won     = r.get("underdog_won")
+            t1      = "🔥" if r.get("ud_triggered") else ""
+            t2      = "🚀" if r.get("overtake") else ""
+            result_icon = "✅" if won else "❌"
+            odds_str = f"({fmt_odds(ud_odds)})" if ud_odds else ""
+
+            lines.append(
+                f"  {result_icon} {away_t} {away_s}:{home_s} {home_t}\n"
+                f"    🐣弱隊：{ud}{odds_str}  {t1}{t2}"
+            )
+        lines.append("")
+
+    # 觸發場次額外說明
+    if triggered:
+        trig_wins  = sum(1 for r in triggered if r.get("underdog_won"))
+        trig_total = len(triggered)
+        lines.append(f"⚡ 觸發場次結果：{trig_wins}勝{trig_total-trig_wins}敗（共{trig_total}場觸發）")
+
+    return "\n".join(lines)
+
+
 # ─── 監控主迴圈 ──────────────────────────────────────────────────────────────
 async def monitor_cycle(context: ContextTypes.DEFAULT_TYPE):
     config  = load_config()
@@ -1277,6 +1352,22 @@ async def monitor_cycle(context: ContextTypes.DEFAULT_TYPE):
                         await context.bot.send_message(chat_id=CHAT_ID, text=msg)
                     except Exception as e:
                         log.error(f"Telegram 發送失敗：{e}")
+
+        # ── 每日結算：當今日追蹤的比賽全部結束時發送統計 ──
+        today_games_in_state = [gs for gs in state.values() if gs.get("date") == today]
+        if today_games_in_state:
+            all_final = all(gs.get("status") == "final" for gs in today_games_in_state)
+            if all_final:
+                summary_sent = load_summary_sent()
+                if summary_sent.get("date") != today:
+                    summary_text = build_daily_summary(today)
+                    if summary_text:
+                        try:
+                            await context.bot.send_message(chat_id=CHAT_ID, text=summary_text)
+                            log.info(f"[結算] 今日結算通知已發送")
+                        except Exception as e:
+                            log.error(f"[結算] Telegram 發送失敗：{e}")
+                    save_summary_sent({"date": today})
 
         # 清理昨天的結束比賽
         to_del = [gid for gid, gs in state.items()
@@ -1760,7 +1851,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "💪 = 強隊\n\n"
         "觸發通知：\n"
         "🔥 弱隊先得分\n"
-        "🚀 弱隊反超（強隊曾領先後被超越）\n\n"
+        "🚀 弱隊反超（強隊曾領先後被超越）\n"
+        "📊 每日結算（當天所有比賽結束後自動發送）\n\n"
         "資料來源：\n"
         "MLB → MLB Stats API + The Odds API\n"
         "KBO/NPB → Playsport比分 + Pinnacle/Odds API賠率"
