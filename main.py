@@ -163,15 +163,17 @@ PLAYSPORT_KBO_CODES: dict[str, str] = {
     "Tigers":   "起亞老虎",
     "Eagles":   "韓華鷹",
     "Heroes":   "奇蒙英雄",
+    "Kiwoom":   "奇蒙英雄",
+    "Nexen":    "奇蒙英雄",
+    "NC":       "NC恐龍",
+    "SSG":      "SSG登陸者",
+    "KT":       "KT巫師",
+    "LG":       "LG雙子",
 }
 PLAYSPORT_CODES: dict[str, dict] = {
     "npb": PLAYSPORT_NPB_CODES,
     "kbo": PLAYSPORT_KBO_CODES,
 }
-
-YUNSAI_URL       = "https://www.sportslottery.com.tw/sports/baseball"
-YUNSAI_CACHE_TTL = 3600   # 1 小時快取
-_yunsai_cache: dict = {"_ts": 0, "data": {}}
 
 PINNACLE_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -442,77 +444,6 @@ async def refresh_mlb_odds(client: httpx.AsyncClient) -> dict:
     return cache
 
 
-async def refresh_kbo_npb_odds(client: httpx.AsyncClient, league: str) -> dict:
-    """從 The Odds API 取得 KBO/NPB 賠率，作為 Pinnacle 無盤時的備用。"""
-    sport_key = f"baseball_{league}"  # baseball_kbo / baseball_npb
-    now = time.monotonic()
-    if now - _odds_last_fetch.get(league, 0) < ODDS_CACHE_TTL and league in _odds_cache:
-        return _odds_cache[league]
-
-    try:
-        r = await client.get(
-            f"{ODDS_API_BASE}/sports/{sport_key}/odds",
-            params={"apiKey": ODDS_API_KEY, "regions": "us",
-                    "markets": "h2h", "oddsFormat": "american"},
-            timeout=10,
-        )
-        r.raise_for_status()
-        events = r.json()
-        log.info(f"[{league.upper()}] Odds API 賠率更新，剩餘配額：{r.headers.get('x-requests-remaining','?')}")
-    except Exception as e:
-        log.error(f"[{league.upper()}] Odds API 錯誤：{e}")
-        return _odds_cache.get(league, {})
-
-    cache: dict = {}
-    for ev in events:
-        h, a = ev.get("home_team", ""), ev.get("away_team", "")
-        h_o = a_o = None
-        for bm in ev.get("bookmakers", []):
-            for mkt in bm.get("markets", []):
-                if mkt["key"] != "h2h":
-                    continue
-                for outcome in mkt.get("outcomes", []):
-                    if normalize(outcome["name"]) == normalize(h):
-                        h_o = outcome["price"]
-                    elif normalize(outcome["name"]) == normalize(a):
-                        a_o = outcome["price"]
-                if h_o is not None and a_o is not None:
-                    break
-            if h_o is not None:
-                break
-        if h_o is not None and a_o is not None:
-            h_zh = team_zh(h)
-            a_zh = team_zh(a)
-            cache[f"{h_zh}|{a_zh}"] = {"home_team": h, "away_team": a,
-                                        "home_odds": int(h_o), "away_odds": int(a_o)}
-
-    _odds_cache[league] = cache
-    _odds_last_fetch[league] = now
-    return cache
-
-
-def _apply_odds_api_to_games(games: list[Game], odds_cache: dict) -> None:
-    """把 Odds API 賠率貼到 game 物件（僅在 home_odds 仍為 None 時填入）。"""
-    for g in games:
-        if g.home_odds is not None:
-            continue
-        h_zh = team_zh(g.home_team)
-        a_zh = team_zh(g.away_team)
-        key_normal  = f"{h_zh}|{a_zh}"
-        key_reverse = f"{a_zh}|{h_zh}"
-        if key_normal in odds_cache:
-            entry = odds_cache[key_normal]
-            g.home_odds = entry["home_odds"]
-            g.away_odds = entry["away_odds"]
-            log.info(f"[Odds API 補充] {h_zh} vs {a_zh}  {fmt_odds(g.home_odds)}/{fmt_odds(g.away_odds)}")
-        elif key_reverse in odds_cache:
-            entry = odds_cache[key_reverse]
-            # 主客顛倒 → 對調賠率
-            g.home_odds = entry["away_odds"]
-            g.away_odds = entry["home_odds"]
-            log.info(f"[Odds API 補充逆向] {h_zh} vs {a_zh}  {fmt_odds(g.home_odds)}/{fmt_odds(g.away_odds)}")
-
-
 def find_mlb_odds(game: Game, cache: dict) -> Optional[dict]:
     norm_h, norm_a = normalize(game.home_team), normalize(game.away_team)
     key = f"{norm_h}_{norm_a}"
@@ -760,96 +691,6 @@ async def fetch_playsport_scores(
     return games
 
 
-async def fetch_yunsai_handicap() -> dict[str, str]:
-    """
-    用 Playwright 從運彩棒球頁抓今日讓分盤。
-    回傳 {球隊中文名: "受讓" | "讓"} 字典。
-    有 1 小時快取避免重複開啟瀏覽器。
-    """
-    global _yunsai_cache
-    now = time.monotonic()
-    if now - _yunsai_cache["_ts"] < YUNSAI_CACHE_TTL and _yunsai_cache["data"]:
-        return _yunsai_cache["data"]
-
-    result: dict[str, str] = {}
-    try:
-        from playwright.async_api import async_playwright
-        from bs4 import BeautifulSoup
-
-        async with async_playwright() as pw:
-            browser = await pw.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-setuid-sandbox",
-                    "--disable-blink-features=AutomationControlled",
-                ],
-            )
-            ctx = await browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/124.0.0.0 Safari/537.36"
-                ),
-                locale="zh-TW",
-                timezone_id="Asia/Taipei",
-                viewport={"width": 1280, "height": 800},
-            )
-            # 隱藏自動化特徵，繞過 Cloudflare 偵測
-            await ctx.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-                Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
-                Object.defineProperty(navigator, 'languages', {get: () => ['zh-TW','zh','en-US','en']});
-                window.chrome = {runtime: {}};
-            """)
-            page = await ctx.new_page()
-            try:
-                await page.goto(YUNSAI_URL, wait_until="networkidle", timeout=60000)
-                await page.wait_for_timeout(5000)
-                html = await page.content()
-                log.info(f"[運彩] 頁面載入完成，大小：{len(html)} bytes")
-            except Exception as e:
-                log.error(f"[運彩] 頁面載入失敗：{e}")
-                html = await page.content()
-            finally:
-                await browser.close()
-
-        # 解析 受讓 / 讓
-        soup = BeautifulSoup(html, "lxml")
-        page_text = soup.get_text(separator="\n")
-        # 輸出前 2000 字供 debug
-        log.info(f"[運彩] 頁面文字前2000字：\n{page_text[:2000]}")
-
-        # 策略：找含「受讓」或「讓」的文字區塊，往上找隊名
-        found_handicap = False
-        lines = [l.strip() for l in page_text.splitlines() if l.strip()]
-        for i, line in enumerate(lines):
-            if "受讓" in line or ("讓" in line and "受讓" not in line and len(line) < 20):
-                # 往前找隊名（通常在 1-3 行內）
-                for j in range(max(0, i - 3), i):
-                    team_candidate = lines[j]
-                    if 2 <= len(team_candidate) <= 10 and not any(
-                        c.isdigit() for c in team_candidate
-                    ):
-                        handicap_type = "受讓" if "受讓" in line else "讓"
-                        result[team_candidate] = handicap_type
-                        log.info(f"[運彩] {team_candidate} → {handicap_type}  (原文：{line})")
-                        found_handicap = True
-
-        if not found_handicap:
-            log.warning("[運彩] 未找到任何受讓/讓資料，可能是頁面結構不同或尚未開盤")
-
-    except ImportError:
-        log.error("[運彩] playwright 或 beautifulsoup4 未安裝")
-    except Exception as e:
-        log.error(f"[運彩] 爬蟲錯誤：{e}")
-
-    _yunsai_cache["data"] = result
-    _yunsai_cache["_ts"] = time.monotonic()
-    return result
-
-
 def determine_underdog_from_yunsai(
     home_team: str, away_team: str, yunsai: dict[str, str]
 ) -> Optional[tuple]:
@@ -1084,37 +925,35 @@ def determine_sides(game: Game, odds: Optional[dict]) -> Optional[tuple]:
     若無法判斷回傳 None。
 
     判斷優先順序：
-    1. Pinnacle spread（讓分盤）：主隊 home_spread > 0 = 主隊受讓 = 主隊弱
-    2. Moneyline 賠率：正號賠率方為弱隊
+    1. Moneyline 賠率：正號賠率方為弱隊（最可靠，跨越不同盤口）
+    2. Pinnacle spread（讓分盤）：僅在無賠率時使用
     """
-    # ── 優先：spread 讓分盤 ──
-    if game.home_spread is not None and game.home_spread != 0:
-        if game.home_spread > 0:
-            # 主隊受讓（正數）= 主隊是弱隊
-            h_o = game.home_odds or 0
-            a_o = game.away_odds or 0
-            return (game.home_team, game.away_team, h_o, a_o, True)
-        else:
-            # 主隊讓分（負數）= 主隊是強隊
-            h_o = game.home_odds or 0
-            a_o = game.away_odds or 0
-            return (game.away_team, game.home_team, a_o, h_o, False)
-
-    # ── 備用：moneyline 賠率 ──
+    # ── 優先：moneyline 賠率 ──
     if odds:
         h_o, a_o = odds["home_odds"], odds["away_odds"]
     elif game.home_odds is not None and game.away_odds is not None:
         h_o, a_o = game.home_odds, game.away_odds
     else:
-        return None
+        h_o = a_o = None
 
-    if h_o == a_o:
-        return None
+    if h_o is not None and a_o is not None and h_o != a_o:
+        if h_o < a_o:  # 主隊賠率低 = 主隊強（讓分方）
+            return (game.away_team, game.home_team, a_o, h_o, False)
+        else:           # 客隊賠率低 = 客隊強
+            return (game.home_team, game.away_team, h_o, a_o, True)
 
-    if h_o < a_o:   # 主隊賠率較低 = 主隊是強隊
-        return (game.away_team, game.home_team, a_o, h_o, False)
-    else:           # 客隊是強隊
-        return (game.home_team, game.away_team, h_o, a_o, True)
+    # ── 備用：spread 讓分盤（Pinnacle 無 moneyline 時）──
+    if game.home_spread is not None and game.home_spread != 0:
+        h_o = game.home_odds or 0
+        a_o = game.away_odds or 0
+        if game.home_spread > 0:
+            # 主隊受讓（正數）= 主隊是弱隊
+            return (game.home_team, game.away_team, h_o, a_o, True)
+        else:
+            # 主隊讓分（負數）= 主隊是強隊
+            return (game.away_team, game.home_team, a_o, h_o, False)
+
+    return None
 
 
 # ─── 觸發邏輯 ────────────────────────────────────────────────────────────────
@@ -1266,14 +1105,16 @@ async def monitor_cycle(context: ContextTypes.DEFAULT_TYPE):
                 ps_games = await fetch_playsport_scores(client, lg)
                 if ps_games:
                     _attach_pinnacle_odds(ps_games, pin_games, pre_odds)
-                    # Pinnacle 無盤時，用 Odds API 補賠率
-                    if any(g.home_odds is None for g in ps_games):
-                        oa_cache = await refresh_kbo_npb_odds(client, lg)
-                        _apply_odds_api_to_games(ps_games, oa_cache)
                     all_games.extend(ps_games)
                 elif pin_games:
                     all_games.extend(pin_games)
         save_pre_odds(pre_odds)
+
+        # 預先抓取 NPB/KBO 逐局比分（供「補觸發」使用）
+        innings_by_league: dict[str, dict] = {}
+        for lg in ["kbo", "npb"]:
+            if config.get(lg):
+                innings_by_league[lg] = await fetch_pinnacle_game_innings(client, lg)
 
         # 逐場處理
         min_odds = config.get("min_odds", 120)
@@ -1297,6 +1138,7 @@ async def monitor_cycle(context: ContextTypes.DEFAULT_TYPE):
                 continue
 
             if gid not in state:
+                missed_live = (game.status == "final")
                 state[gid] = {
                     "underdog":             team_zh(underdog),
                     "favorite":             team_zh(favorite),
@@ -1312,11 +1154,13 @@ async def monitor_cycle(context: ContextTypes.DEFAULT_TYPE):
                     "status":               "live",
                     "league":               game.league,
                     "date":                 today,
+                    "missed_live":          missed_live,
                 }
                 changed = True
                 log.info(
                     f"[{game.league.upper()}] 新比賽：{game.away_team} @ {game.home_team} "
                     f"| 弱隊：{underdog}({fmt_odds(ud_odds)})"
+                    + (" [首次發現已結束，嘗試補觸發]" if missed_live else "")
                 )
 
             gs = state[gid]
@@ -1328,6 +1172,63 @@ async def monitor_cycle(context: ContextTypes.DEFAULT_TYPE):
                 ud_score   = game.home_score if ud_is_home else game.away_score
                 fav_score  = game.home_score if not ud_is_home else game.away_score
                 ud_won = ud_score > fav_score
+
+                # ── 補觸發：首次見到即已結束的比賽，嘗試用逐局比分重建觸發 ──
+                if gs.get("missed_live") and game.league in ("kbo", "npb"):
+                    innings_map = innings_by_league.get(game.league, {})
+                    h_zh = team_zh(game.home_team)
+                    a_zh = team_zh(game.away_team)
+                    inn_data = None
+                    for key, val in innings_map.items():
+                        parts_k = key.split("|", 1)
+                        if len(parts_k) != 2:
+                            continue
+                        k_h, k_a = parts_k
+                        if _zh_match(h_zh, k_h) and _zh_match(a_zh, k_a):
+                            inn_data = val
+                            break
+                        if _zh_match(h_zh, k_a) and _zh_match(a_zh, k_h):
+                            inn_data = {"home_innings": val["away_innings"],
+                                        "away_innings": val["home_innings"]}
+                            break
+                    if inn_data:
+                        t1, t2, t1_inn, t2_inn = simulate_triggers(
+                            ud_is_home,
+                            inn_data["home_innings"],
+                            inn_data["away_innings"],
+                        )
+                        league_tag = game.league.upper()
+                        ud_name  = gs.get("underdog", "")
+                        fav_name = gs.get("favorite", "")
+                        spread_val = gs.get("home_spread")
+                        if spread_val:
+                            pts = abs(spread_val)
+                            spread_str = f"受讓{pts:.1f}分"
+                        else:
+                            ud_odds_v = gs.get("underdog_odds")
+                            spread_str = fmt_odds(ud_odds_v) if ud_odds_v else "弱"
+                        retro_msgs: list[str] = []
+                        if t1:
+                            gs["first_score_notified"] = True
+                            retro_msgs.append(
+                                f"⚾ [{league_tag}] 🔥 弱隊先得分！第{t1_inn}局（補報）\n"
+                                f"🐣弱隊（{spread_str}）：{ud_name}  {ud_score}分\n"
+                                f"💪強隊：{fav_name}  {fav_score}分"
+                            )
+                        if t2:
+                            gs["overtake_notified"] = True
+                            retro_msgs.append(
+                                f"⚾ [{league_tag}] 🚀 弱隊反超！第{t2_inn}局（補報）\n"
+                                f"🐣弱隊（{spread_str}）：{ud_name}  {ud_score}分\n"
+                                f"💪強隊：{fav_name}  {fav_score}分"
+                            )
+                        for msg in retro_msgs:
+                            log.info(f"RETRO TRIGGER → {msg}")
+                            try:
+                                await context.bot.send_message(chat_id=CHAT_ID, text=msg)
+                            except Exception as e:
+                                log.error(f"Telegram 補報發送失敗：{e}")
+
                 append_result({
                     "date":          today,
                     "league":        game.league,
@@ -1459,9 +1360,6 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
             kbo_games = await fetch_playsport_scores(client, "kbo")
             if kbo_games:
                 _attach_pinnacle_odds(kbo_games, pin_kbo, pre_odds)
-                if any(g.home_odds is None for g in kbo_games):
-                    oa_kbo = await refresh_kbo_npb_odds(client, "kbo")
-                    _apply_odds_api_to_games(kbo_games, oa_kbo)
             elif pin_kbo:
                 kbo_games = pin_kbo
         if cfg.get("npb"):
@@ -1470,9 +1368,6 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
             npb_games = await fetch_playsport_scores(client, "npb")
             if npb_games:
                 _attach_pinnacle_odds(npb_games, pin_npb, pre_odds)
-                if any(g.home_odds is None for g in npb_games):
-                    oa_npb = await refresh_kbo_npb_odds(client, "npb")
-                    _apply_odds_api_to_games(npb_games, oa_npb)
             elif pin_npb:
                 npb_games = pin_npb
 
@@ -1630,9 +1525,6 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ps_games  = await fetch_playsport_scores(client, lg)
                 if ps_games:
                     _attach_pinnacle_odds(ps_games, pin_games, pre_odds)
-                    if any(g.home_odds is None for g in ps_games):
-                        oa_cache = await refresh_kbo_npb_odds(client, lg)
-                        _apply_odds_api_to_games(ps_games, oa_cache)
                     all_games.extend(ps_games)
                 elif pin_games:
                     all_games.extend(pin_games)
@@ -1881,6 +1773,20 @@ async def cmd_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_clearstate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """清除今日 game_state，讓監控從頭重新偵測比賽。"""
+    state = load_state()
+    today = date.today().isoformat()
+    today_keys = [k for k, v in state.items() if v.get("date") == today]
+    for k in today_keys:
+        del state[k]
+    save_state(state)
+    await update.message.reply_text(
+        f"🗑 已清除今日 state（{len(today_keys)} 筆）\n"
+        f"Bot 下次 poll 時會重新偵測今日比賽。"
+    )
+
+
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "⚾ 棒球追蹤器指令\n\n"
@@ -1919,6 +1825,7 @@ def main():
     app.add_handler(CommandHandler("threshold", cmd_threshold))
     app.add_handler(CommandHandler("record",    cmd_record))
     app.add_handler(CommandHandler("backtest",  cmd_backtest))
+    app.add_handler(CommandHandler("clearstate", cmd_clearstate))
     app.add_handler(CommandHandler("help",      cmd_help))
 
     app.job_queue.run_repeating(monitor_cycle, interval=POLL_INTERVAL, first=10)
