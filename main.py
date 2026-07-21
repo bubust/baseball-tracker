@@ -1136,10 +1136,9 @@ def check_triggers(game: Game, gs: dict) -> list[str]:
     if gs.get("first_scorer") == "underdog" and not gs["first_score_notified"]:
         gs["first_score_notified"] = True
         msgs.append(
-            f"⚾ [{league_tag}] {underdog}({spread_str}) "
-            f"{ud_score}:{fav_score} "
-            f"{favorite} "
-            f"| 第{inning}局 🔥 弱隊先得分！"
+            f"⚾ [{league_tag}] 🔥 弱隊先得分！第{inning}局\n"
+            f"🐣弱隊（{spread_str}）：{underdog}  {ud_score}分\n"
+            f"💪強隊：{favorite}  {fav_score}分"
         )
 
     # ── 追蹤強隊是否曾領先 ──
@@ -1152,10 +1151,9 @@ def check_triggers(game: Game, gs: dict) -> list[str]:
             and not gs["overtake_notified"]):
         gs["overtake_notified"] = True
         msgs.append(
-            f"⚾ [{league_tag}] {underdog}({spread_str}) "
-            f"{ud_score}:{fav_score} "
-            f"{favorite} "
-            f"| 第{inning}局 🚀 弱隊反超！"
+            f"⚾ [{league_tag}] 🚀 弱隊反超！第{inning}局\n"
+            f"🐣弱隊（{spread_str}）：{underdog}  {ud_score}分\n"
+            f"💪強隊：{favorite}  {fav_score}分"
         )
 
     return msgs
@@ -1329,25 +1327,6 @@ async def cmd_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"⛔ {lg.upper()} 監控已關閉")
 
 
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cfg   = load_config()
-    state = load_state()
-
-    lines = ["📊 棒球追蹤器狀態\n"]
-    for lg in ["mlb", "kbo", "npb"]:
-        icon = "✅" if cfg.get(lg) else "⛔"
-        src  = "MLB Stats + Odds API" if lg == "mlb" else "Pinnacle Guest API"
-        lines.append(f"{icon} {lg.upper()} ({src})")
-
-    live = [gs for gs in state.values() if gs.get("status") == "live"]
-    lines.append(f"\n🎮 進行中比賽：{len(live)} 場")
-    for gs in live[:5]:
-        ud  = gs.get("underdog", "")
-        fav = gs.get("favorite", "")
-        lg  = gs.get("league", "").upper()
-        lines.append(f"  • [{lg}] {ud} vs {fav}")
-
-    await update.message.reply_text("\n".join(lines))
 
 
 async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1454,24 +1433,6 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
-async def cmd_yunsai(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """顯示目前從運彩抓到的讓分盤資料（debug 用）。強制重新爬取請加 refresh 參數。"""
-    if context.args and context.args[0].lower() == "refresh":
-        _yunsai_cache["_ts"] = 0   # 清快取
-    await update.message.reply_text("⏳ 正在開啟瀏覽器爬取運彩...")
-    yunsai = await fetch_yunsai_handicap()
-    if not yunsai:
-        await update.message.reply_text(
-            "❌ 運彩無資料\n可能原因：\n• 今日尚未開盤\n• 頁面結構有變\n• 請查 Railway log 確認"
-        )
-        return
-    lines = ["🏟 運彩讓分盤（今日）\n"]
-    for team, htype in yunsai.items():
-        icon = "⬆️" if htype == "受讓" else "⬇️"
-        lines.append(f"  {icon} {team} → {htype}")
-    await update.message.reply_text("\n".join(lines))
-
-
 async def cmd_record(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """顯示累積弱隊買贏/輸戰績。用法：/record [today|mlb|kbo|npb]"""
     results = load_results()
@@ -1526,8 +1487,7 @@ async def cmd_record(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """手動查詢各聯盟目前比賽狀況，顯示是否已觸發條件。"""
-    # 可指定聯盟：/check npb  或  /check（全部）
+    """查詢監控狀態 + 即時比賽觸發情況。/check [mlb|kbo|npb]"""
     cfg = load_config()
     target = context.args[0].lower() if context.args else None
     if target and target not in VALID_LEAGUES:
@@ -1536,7 +1496,13 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     state  = load_state()
     today  = date.today().isoformat()
-    lines  = [f"🔍 即時觸發檢查（{today}）\n"]
+
+    # ── 頂部顯示開關狀態 ──
+    status_parts = []
+    for lg in ["mlb", "kbo", "npb"]:
+        icon = "✅" if cfg.get(lg) else "⛔"
+        status_parts.append(f"{icon}{lg.upper()}")
+    lines = [f"⚾ 棒球追蹤器  {'  '.join(status_parts)}", f"📅 {today}\n"]
 
     async with httpx.AsyncClient() as client:
         all_games: list[Game] = []
@@ -1561,6 +1527,9 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ps_games  = await fetch_playsport_scores(client, lg)
                 if ps_games:
                     _attach_pinnacle_odds(ps_games, pin_games, pre_odds)
+                    if any(g.home_odds is None for g in ps_games):
+                        oa_cache = await refresh_kbo_npb_odds(client, lg)
+                        _apply_odds_api_to_games(ps_games, oa_cache)
                     all_games.extend(ps_games)
                 elif pin_games:
                     all_games.extend(pin_games)
@@ -1632,75 +1601,6 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if live_count == 0:
         lines.append("目前無進行中或已結束賽事")
 
-    await update.message.reply_text("\n".join(lines))
-
-
-async def cmd_triggers(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """顯示今日已觸發的比賽記錄（弱隊先得分 / 反超）。"""
-    today = date.today().isoformat()
-    lines = [f"⚡ 今日觸發紀錄（{today}）\n"]
-
-    LEAGUE_FLAG = {"mlb": "🇺🇸 MLB", "kbo": "🇰🇷 KBO", "npb": "🇯🇵 NPB"}
-    triggered: list[dict] = []
-
-    # 1. 從 results.json（已結束場次）
-    for r in load_results():
-        if r.get("date") != today:
-            continue
-        if r.get("ud_triggered") or r.get("overtake"):
-            triggered.append({
-                "league":      r.get("league", ""),
-                "away":        r.get("away_team", "?"),
-                "home":        r.get("home_team", "?"),
-                "away_score":  r.get("away_score", 0),
-                "home_score":  r.get("home_score", 0),
-                "underdog":    r.get("underdog", "?"),
-                "ud_trig":     r.get("ud_triggered", False),
-                "overtake":    r.get("overtake", False),
-                "status":      "final",
-            })
-
-    # 2. 從 state（進行中場次）
-    for gs in load_state().values():
-        if gs.get("date") != today:
-            continue
-        if gs.get("status") == "final":
-            continue   # 已結束的已在 results 裡
-        if gs.get("first_score_notified") or gs.get("overtake_notified"):
-            triggered.append({
-                "league":    gs.get("league", ""),
-                "away":      None,
-                "home":      None,
-                "underdog":  gs.get("underdog", "?"),
-                "favorite":  gs.get("favorite", "?"),
-                "ud_trig":   gs.get("first_score_notified", False),
-                "overtake":  gs.get("overtake_notified", False),
-                "status":    "live",
-            })
-
-    if not triggered:
-        lines.append("今日暫無觸發記錄")
-        await update.message.reply_text("\n".join(lines))
-        return
-
-    for lg in ["npb", "kbo", "mlb"]:
-        items = [t for t in triggered if t["league"] == lg]
-        if not items:
-            continue
-        lines.append(LEAGUE_FLAG.get(lg, lg.upper()))
-        for t in items:
-            t1 = "🔥先得分 " if t["ud_trig"] else ""
-            t2 = "🚀反超 " if t["overtake"] else ""
-            ud = t["underdog"]
-            status_str = "已結束" if t["status"] == "final" else "進行中"
-            if t["away"] is not None:
-                score = f"{t['away_score']}:{t['home_score']}"
-                lines.append(f"  {t1}{t2}{t['away']} {score} {t['home']} [{status_str}]  弱隊:{ud}")
-            else:
-                lines.append(f"  {t1}{t2}{ud} vs {t['favorite']} [{status_str}]")
-        lines.append("")
-
-    lines.append(f"共 {len(triggered)} 筆觸發")
     await update.message.reply_text("\n".join(lines))
 
 
@@ -1849,24 +1749,21 @@ async def cmd_backtest(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "⚾ 棒球追蹤器指令\n\n"
-        "/on          — 開啟全部聯盟監控\n"
-        "/on mlb|kbo|npb  — 開啟指定聯盟\n"
-        "/off         — 關閉全部聯盟監控\n"
-        "/off mlb|kbo|npb — 關閉指定聯盟\n"
-        "/status          — 目前狀態\n"
-        "/today           — 今日全部賽程\n"
-        "/check [聯盟]    — 即時查觸發狀況（含賠率）\n"
-        "/triggers        — 今日已觸發比賽一覽\n"
-        "/backtest [日期] — 回測弱隊觸發條件（KBO/NPB）\n"
-        "/record [聯盟/today] — 弱隊買累積戰績\n"
-        "/yunsai [refresh]    — 運彩讓分盤資料\n"
-        "/help            — 顯示說明\n\n"
-        "觸發條件：\n"
-        "🔥 弱隊先得分（正號賠率隊率先得分）\n"
-        "🚀 弱隊反超（強隊領先後被弱隊超越）\n\n"
+        "/on [mlb|kbo|npb]  — 開啟監控（不加參數 = 全開）\n"
+        "/off [mlb|kbo|npb] — 關閉監控（不加參數 = 全關）\n"
+        "/today             — 今日賽程 + 🐣弱隊標示\n"
+        "/check [聯盟]      — 監控狀態 + 即時觸發情況\n"
+        "/record [聯盟/today] — 弱隊累積戰績\n"
+        "/backtest [YYYYMMDD] — 回測觸發條件（KBO/NPB）\n"
+        "/help              — 顯示說明\n\n"
+        "🐣 = 弱隊（賠率正號/受讓方）\n"
+        "💪 = 強隊\n\n"
+        "觸發通知：\n"
+        "🔥 弱隊先得分\n"
+        "🚀 弱隊反超（強隊曾領先後被超越）\n\n"
         "資料來源：\n"
         "MLB → MLB Stats API + The Odds API\n"
-        "KBO/NPB → Pinnacle Guest API（免費，無需帳號）"
+        "KBO/NPB → Playsport比分 + Pinnacle/Odds API賠率"
     )
     await update.message.reply_text(text)
 
@@ -1876,14 +1773,11 @@ def main():
     log.info("⚾ 棒球追蹤器啟動中...")
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("on",     cmd_on))
-    app.add_handler(CommandHandler("off",    cmd_off))
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("today",  cmd_today))
-    app.add_handler(CommandHandler("yunsai", cmd_yunsai))
-    app.add_handler(CommandHandler("record", cmd_record))
+    app.add_handler(CommandHandler("on",       cmd_on))
+    app.add_handler(CommandHandler("off",      cmd_off))
+    app.add_handler(CommandHandler("today",    cmd_today))
     app.add_handler(CommandHandler("check",    cmd_check))
-    app.add_handler(CommandHandler("triggers", cmd_triggers))
+    app.add_handler(CommandHandler("record",   cmd_record))
     app.add_handler(CommandHandler("backtest", cmd_backtest))
     app.add_handler(CommandHandler("help",     cmd_help))
 
