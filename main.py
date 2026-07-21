@@ -429,6 +429,74 @@ async def refresh_mlb_odds(client: httpx.AsyncClient) -> dict:
     return cache
 
 
+async def refresh_kbo_npb_odds(client: httpx.AsyncClient, league: str) -> dict:
+    """從 The Odds API 取得 KBO/NPB 賠率，作為 Pinnacle 無盤時的備用。"""
+    sport_key = f"baseball_{league}"  # baseball_kbo / baseball_npb
+    now = time.monotonic()
+    if now - _odds_last_fetch.get(league, 0) < ODDS_CACHE_TTL and league in _odds_cache:
+        return _odds_cache[league]
+
+    try:
+        r = await client.get(
+            f"{ODDS_API_BASE}/sports/{sport_key}/odds",
+            params={"apiKey": ODDS_API_KEY, "regions": "us",
+                    "markets": "h2h", "oddsFormat": "american"},
+            timeout=10,
+        )
+        r.raise_for_status()
+        events = r.json()
+        log.info(f"[{league.upper()}] Odds API 賠率更新，剩餘配額：{r.headers.get('x-requests-remaining','?')}")
+    except Exception as e:
+        log.error(f"[{league.upper()}] Odds API 錯誤：{e}")
+        return _odds_cache.get(league, {})
+
+    cache: dict = {}
+    for ev in events:
+        h, a = ev.get("home_team", ""), ev.get("away_team", "")
+        h_o = a_o = None
+        for bm in ev.get("bookmakers", []):
+            for mkt in bm.get("markets", []):
+                if mkt["key"] != "h2h":
+                    continue
+                for outcome in mkt.get("outcomes", []):
+                    if normalize(outcome["name"]) == normalize(h):
+                        h_o = outcome["price"]
+                    elif normalize(outcome["name"]) == normalize(a):
+                        a_o = outcome["price"]
+                if h_o is not None and a_o is not None:
+                    break
+            if h_o is not None:
+                break
+        if h_o is not None and a_o is not None:
+            h_zh = team_zh(h)
+            a_zh = team_zh(a)
+            cache[f"{h_zh}|{a_zh}"] = {"home_team": h, "away_team": a,
+                                        "home_odds": int(h_o), "away_odds": int(a_o)}
+
+    _odds_cache[league] = cache
+    _odds_last_fetch[league] = now
+    return cache
+
+
+def _apply_odds_api_to_games(games: list[Game], odds_cache: dict) -> None:
+    """把 Odds API 賠率貼到 game 物件（僅在 home_odds 仍為 None 時填入）。"""
+    for g in games:
+        if g.home_odds is not None:
+            continue
+        h_zh = team_zh(g.home_team)
+        a_zh = team_zh(g.away_team)
+        entry = odds_cache.get(f"{h_zh}|{a_zh}") or odds_cache.get(f"{a_zh}|{h_zh}")
+        if entry:
+            if f"{h_zh}|{a_zh}" in odds_cache:
+                g.home_odds = entry["home_odds"]
+                g.away_odds = entry["away_odds"]
+            else:
+                # 主客顛倒 → 對調
+                g.home_odds = entry["away_odds"]
+                g.away_odds = entry["home_odds"]
+            log.info(f"[Odds API 補充] {h_zh} vs {a_zh} 賠率 {g.home_odds}/{g.away_odds}")
+
+
 def find_mlb_odds(game: Game, cache: dict) -> Optional[dict]:
     norm_h, norm_a = normalize(game.home_team), normalize(game.away_team)
     key = f"{norm_h}_{norm_a}"
@@ -1125,6 +1193,10 @@ async def monitor_cycle(context: ContextTypes.DEFAULT_TYPE):
                 ps_games = await fetch_playsport_scores(client, lg)
                 if ps_games:
                     _attach_pinnacle_odds(ps_games, pin_games, pre_odds)
+                    # Pinnacle 無盤時，用 Odds API 補賠率
+                    if any(g.home_odds is None for g in ps_games):
+                        oa_cache = await refresh_kbo_npb_odds(client, lg)
+                        _apply_odds_api_to_games(ps_games, oa_cache)
                     all_games.extend(ps_games)
                 elif pin_games:
                     all_games.extend(pin_games)
@@ -1308,6 +1380,9 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
             kbo_games = await fetch_playsport_scores(client, "kbo")
             if kbo_games:
                 _attach_pinnacle_odds(kbo_games, pin_kbo, pre_odds)
+                if any(g.home_odds is None for g in kbo_games):
+                    oa_kbo = await refresh_kbo_npb_odds(client, "kbo")
+                    _apply_odds_api_to_games(kbo_games, oa_kbo)
             elif pin_kbo:
                 kbo_games = pin_kbo
         if cfg.get("npb"):
@@ -1316,6 +1391,9 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
             npb_games = await fetch_playsport_scores(client, "npb")
             if npb_games:
                 _attach_pinnacle_odds(npb_games, pin_npb, pre_odds)
+                if any(g.home_odds is None for g in npb_games):
+                    oa_npb = await refresh_kbo_npb_odds(client, "npb")
+                    _apply_odds_api_to_games(npb_games, oa_npb)
             elif pin_npb:
                 npb_games = pin_npb
 
@@ -1356,6 +1434,16 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 log.debug(f"[未翻譯] {g.league.upper()} 客隊：{g.away_team!r}")
             if home_zh == g.home_team:
                 log.debug(f"[未翻譯] {g.league.upper()} 主隊：{g.home_team!r}")
+
+            # 標記弱隊（🐣）
+            sides = determine_sides(g, None)
+            if sides is not None:
+                _, _, _, _, ud_is_home = sides
+                if ud_is_home:
+                    home_zh = f"🐣{home_zh}"
+                else:
+                    away_zh = f"🐣{away_zh}"
+
             lines.append(f"  {time_str} {away_zh} @ {home_zh}{score_str} [{status_str}]{odds_str}")
         lines.append("")
         total += len(games)
